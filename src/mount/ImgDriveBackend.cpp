@@ -31,32 +31,69 @@ std::chrono::milliseconds validateTimeout(std::chrono::milliseconds timeout) {
    return timeout;
 }
 
-void validateCachedSource(const MountRecord& record,
-                          const FlacMetadata& metadata,
-                          const TrackLayout& layout) {
-   // Read the file actually handed to ImgDrive, not just the in-memory writer
-   // output. Neither CUE creation nor this check creates a cached audio alias.
-   std::ifstream input(record.cuePath, std::ios::binary);
-   if (!input) {
-      throw std::runtime_error("cannot open cached CUE: " + pathToUtf8(record.cuePath));
+void validateResources(const MountRecord& record,
+                       const FlacMetadata& metadata,
+                       const TrackLayout& layout,
+                       MountFileSystem& files) {
+   if (readMountCue(record.cuePath) != record.cueText || files.identity(record.cuePath) != record.cueIdentity ||
+       files.identity(record.audioPath) != record.audioIdentity) {
+      throw std::runtime_error("mount resources changed before invocation; preserved");
    }
-   const std::string contents{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
-   if (input.bad() || contents != record.cueText) {
-      throw std::runtime_error("cached CUE differs from the prepared mount record");
+   const auto parsed = parseCueTextMetadata(record.cueText);
+   const auto path = pathFromUtf8(parsed.fileName);
+   const auto reference = path.is_absolute() ? path : record.cuePath.parent_path() / path;
+   if (parsed.fileType != "WAVE" || !compareTrackLayouts(layout, TrackLayout::fromText(metadata, parsed)).empty() ||
+       !std::filesystem::equivalent(reference, record.audioPath) ||
+       record.cuePath.stem() != record.audioPath.stem() || record.cuePath.parent_path() != record.audioPath.parent_path()) {
+      throw std::runtime_error("ImgDrive requires a matching adjacent CUE/FLAC pair with equivalent layout");
    }
-   const auto parsed = parseCueTextMetadata(contents);
-   const auto reference = pathFromUtf8(parsed.fileName);
-   if (parsed.fileType != "WAVE" || !reference.is_absolute() ||
-       !compareTrackLayouts(layout, TrackLayout::fromText(metadata, parsed)).empty() ||
-       !std::filesystem::is_regular_file(reference) || !std::filesystem::equivalent(reference, record.sourcePath)) {
-      throw std::runtime_error("cached CUE must reference the original FLAC by its absolute path");
-   }
-   std::ifstream source(reference, std::ios::binary);
+   std::ifstream audio(record.audioPath, std::ios::binary);
    char signature[4]{};
-   source.read(signature, sizeof(signature));
-   if (!source || std::string_view(signature, sizeof(signature)) != "fLaC") {
-      throw std::runtime_error("cached CUE's original FLAC reference is missing, unreadable, or changed: " + parsed.fileName);
+   audio.read(signature, sizeof(signature));
+   if (!audio || std::string_view(signature, sizeof(signature)) != "fLaC") {
+      throw std::runtime_error("selected FLAC resource is unreadable or incomplete");
    }
+}
+
+bool samePath(const std::filesystem::path& first, const std::filesystem::path& second) {
+   return std::filesystem::weakly_canonical(first) == std::filesystem::weakly_canonical(second) ||
+          (mountPathExists(first) && mountPathExists(second) && std::filesystem::equivalent(first, second));
+}
+
+bool compatibleCue(const std::filesystem::path& cuePath,
+                   const std::filesystem::path& source,
+                   const FlacMetadata& metadata,
+                   const TrackLayout& layout,
+                   std::string& contents,
+                   std::string& reason) {
+   try {
+      contents = readMountCue(cuePath);
+      // Do not borrow a generated CUE from another active mount/cache. A separate
+      // staging pair avoids deleting shared resources or unmounting both by name.
+      if (contents.find("REM FlacCD ImgDrive mount ") != std::string::npos) {
+         reason = "CUE is managed by another FlacCD mount";
+         return false;
+      }
+      const auto parsed = parseCueTextMetadata(contents);
+      const auto reference = pathFromUtf8(parsed.fileName);
+      const auto audio = reference.is_absolute() ? reference : cuePath.parent_path() / reference;
+      if (parsed.fileType != "WAVE" || cuePath.stem() != source.stem() ||
+          !std::filesystem::equivalent(audio, source)) {
+         reason = "FILE reference/type or matching basename does not identify the intended FLAC";
+         return false;
+      }
+      const auto differences = compareTrackLayouts(layout, TrackLayout::fromText(metadata, parsed));
+      if (!differences.empty()) {
+         reason = differences.front();
+         return false;
+      }
+      return true;
+   } catch (const std::runtime_error& error) {
+      reason = error.what();
+   } catch (const std::invalid_argument& error) {
+      reason = error.what();
+   }
+   return false;
 }
 
 char normalizeDrive(char drive) {
@@ -74,9 +111,12 @@ char normalizeDrive(char drive) {
 ImgDriveBackend::ImgDriveBackend(ProcessRunner& host,
                                  const std::filesystem::path& executablePath,
                                  const std::filesystem::path& cacheRoot,
-                                 std::chrono::milliseconds operationTimeout)
+                                 std::chrono::milliseconds operationTimeout,
+                                 MountFileSystem* fileSystem,
+                                 MountLog logger)
    : runner(host), executable(validateExecutable(executablePath)), timeout(validateTimeout(operationTimeout)),
-     guard(runner.lock(cacheRoot, timeout)), store(cacheRoot) {
+     files(fileSystem ? *fileSystem : nativeFiles), log(std::move(logger)),
+     guard(runner.lock(cacheRoot, timeout)), store(cacheRoot, &files) {
    if (!guard) {
       throw std::runtime_error("mount-state lock was not acquired");
    }
@@ -95,7 +135,8 @@ ProcessResult ImgDriveBackend::invoke(std::vector<std::string> arguments) {
 MountRecord ImgDriveBackend::mount(const std::filesystem::path& source,
                                    std::optional<char> requestedDrive,
                                    std::string_view layoutSource,
-                                   const MountPrepared& prepared) {
+                                   const MountPrepared& prepared,
+                                   bool noCopy) {
    char drive = 0;
    if (requestedDrive) {
       drive = normalizeDrive(*requestedDrive);
@@ -128,23 +169,16 @@ MountRecord ImgDriveBackend::mount(const std::filesystem::path& source,
    const auto original = std::filesystem::canonical(source);
    const auto metadata = FlacMetadataInspector{}.inspect(original);
    const auto layout = selectTrackLayout(metadata, layoutSource);
-   const auto cue = generateFlacCueSheet(layout, metadata, original);
-   const auto record = store.create(drive, original, cue);
+   const auto record = prepare(drive, original, metadata, layout, noCopy);
    store.validate(record);
-   // Verify again immediately before invoking the mounter. No implicit -m or
-   // default-drive fallback can replace a different drive accidentally.
-   if (runner.inspectDrive(drive) != MediaState::Empty) {
-      throw std::runtime_error("drive changed during preparation; prepared CUE retained for safe recovery");
-   }
-   validateCachedSource(record, metadata, layout);
+   validateResources(record, metadata, layout, files);
    if (prepared) {
       prepared(record);
-      // Diagnostic callbacks may run application code; recheck before handing off.
       store.validate(record);
-      validateCachedSource(record, metadata, layout);
-      if (runner.inspectDrive(drive) != MediaState::Empty) {
-         throw std::runtime_error("drive changed during preparation; prepared CUE retained for safe recovery");
-      }
+      validateResources(record, metadata, layout, files);
+   }
+   if (runner.inspectDrive(drive) != MediaState::Empty) {
+      throw std::runtime_error("drive changed during preparation; resources retained for recovery");
    }
    store.mark(record, MountState::Mounting);
    const auto result = invoke({"-m:" + std::string(1, drive), pathToUtf8(record.cuePath)});
@@ -160,6 +194,98 @@ MountRecord ImgDriveBackend::mount(const std::filesystem::path& source,
    } while (std::chrono::steady_clock::now() < deadline);
    throw std::runtime_error("mount not confirmed: optical drive/TOC did not match before timeout; "
                             "CUE and mounting state retained; use flaccd status/unmount; ImgDrive output: " + result.diagnostics);
+}
+
+MountRecord ImgDriveBackend::prepare(char drive,
+                                     const std::filesystem::path& source,
+                                     const FlacMetadata& metadata,
+                                     const TrackLayout& layout,
+                                     bool noCopy) {
+   auto extension = pathToUtf8(source.extension());
+   for (auto& character : extension) {
+      if (character >= 'A' && character <= 'Z') {
+         character = static_cast<char>(character - 'A' + 'a');
+      }
+   }
+   if (extension != ".flac") {
+      throw std::invalid_argument("ImgDrive staging requires a .flac filename");
+   }
+   const auto generated = generateRelativeFlacCueSheet(layout, metadata, pathToUtf8(source.filename()));
+   auto adjacent = source;
+   adjacent.replace_extension(".cue");
+   bool inUse = false;
+   for (const auto& existing : store.records()) {
+      inUse = inUse || samePath(existing.cuePath, adjacent);
+   }
+   const auto reuse = [&]() -> std::optional<MountRecord> {
+      std::string contents;
+      std::string reason;
+      if (!inUse && compatibleCue(adjacent, source, metadata, layout, contents, reason)) {
+         const auto intent = store.begin(drive, source, contents, CueLocation::Existing);
+         if (log) {
+            log("Reusing equivalent external CUE unchanged: " + pathToUtf8(adjacent));
+         }
+         return store.complete(intent, AudioStorage::Original);
+      }
+      if (log) {
+         log("External CUE conflict; preserving it and using isolated staging: " + pathToUtf8(adjacent) +
+             "; " + (inUse ? "already tracked by another mount" : reason));
+      }
+      return std::nullopt;
+   };
+   if (mountPathExists(adjacent)) {
+      if (const auto existing = reuse()) {
+         return *existing;
+      }
+   } else if (!inUse) {
+      const auto intent = store.begin(drive, source, generated, CueLocation::Adjacent);
+      const auto error = files.createCueExclusive(intent.cuePath, intent.cueText);
+      if (!error) {
+         if (log) {
+            log("Created adjacent CUE without copying audio: " + pathToUtf8(intent.cuePath));
+         }
+         return store.complete(intent, AudioStorage::Original);
+      }
+      // Exclusive-create failure created no file. Delete only the cache intent,
+      // never the target that another process might have created in the race.
+      store.discardEmptyPreparation(intent);
+      if (error == std::errc::file_exists) {
+         if (const auto existing = reuse()) {
+            return *existing;
+         }
+      } else if (!expectedLinkFailure(error)) {
+         throw std::filesystem::filesystem_error("create adjacent CUE", adjacent, error);
+      } else if (log) {
+         log("Cannot create adjacent CUE; using isolated staging: " + error.message());
+      }
+   }
+   const auto intent = store.begin(drive, source, generated, CueLocation::Staged);
+   auto storage = AudioStorage::HardLink;
+   const auto error = files.hardLink(source, intent.audioPath);
+   if (error) {
+      if (!expectedLinkFailure(error)) {
+         throw std::filesystem::filesystem_error("stage FLAC hard link", source, intent.audioPath, error);
+      }
+      if (noCopy) {
+         store.discardEmptyPreparation(intent);
+         throw std::runtime_error("--no-copy: no compatible reusable/adjacent CUE and hard-link staging failed: " + error.message());
+      }
+      if (log) {
+         log("Hard-link staging unavailable: " + error.message());
+      }
+      storage = AudioStorage::Copy;
+      files.copyCompressed(source, intent.audioPath, log);
+   } else if (log) {
+      log("Staged FLAC hard link (no audio copy): " + pathToUtf8(intent.audioPath));
+   }
+   if (std::filesystem::file_size(intent.audioPath) != std::filesystem::file_size(source)) {
+      throw std::runtime_error("staged FLAC has wrong size; incomplete resources retained, never mounted");
+   }
+   const auto cueError = files.createCueExclusive(intent.cuePath, intent.cueText);
+   if (cueError) {
+      throw std::system_error(cueError, "create staged matching CUE");
+   }
+   return store.complete(intent, storage);
 }
 
 void ImgDriveBackend::unmount(char requestedDrive) {
@@ -178,6 +304,9 @@ void ImgDriveBackend::unmount(char requestedDrive) {
    }
    const auto& record = *selected;
    store.validate(record);
+   if (record.state == MountState::Preparing) {
+      throw std::runtime_error("preparation never reached ImgDrive; incomplete resources preserved for ownership inspection");
+   }
    store.mark(record, MountState::Unmounting);
    // Vendor-documented image-specific unmount, never bare -u or -u:D.
    const auto result = invoke({"-u", pathToUtf8(record.cuePath)});

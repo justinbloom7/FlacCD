@@ -366,11 +366,28 @@ required by automated tests.
 ## ImgDrive mounting backend (Windows)
 
 ImgDrive is the preferred mounting backend. The Windows-only `flaccd.exe`
-creates a small persistent external CUE referencing the **original FLAC** with
-`FILE "absolute-path.flac" WAVE`, then invokes the independently installed
-ImgDrive. It does not decode the album into a BIN, modify the FLAC, install a
-kernel driver, or replace the existing export tools. BIN/CUE export remains
-an independent fallback.
+mounts a small external CUE beside a FLAC with the **same basename**. Manual
+Windows testing found that the installed ImgDrive looks for `Zelda.flac` beside
+`Zelda.cue`, even when FILE names an absolute path elsewhere. This compatibility
+rule is isolated in the ImgDrive backend; portable export tools remain independent.
+No raw BIN is generated, no original FLAC is modified, and no driver is installed.
+
+The backend selects these strategies in order:
+
+1. Reuse adjacent `Zelda.cue` if its normalized layout matches the embedded
+   layout and its WAVE FILE reference identifies the original `Zelda.flac`.
+   Whitespace, comments, UTF-8 BOM, and formatting may differ. This user-owned
+   CUE is never modified or deleted. Conflicts are reported and preserved.
+2. If absent, exclusively create `Zelda.cue` beside the original FLAC, using
+   `FILE "Zelda.flac" WAVE`. An actual creation failure triggers staging;
+   permission bits are not used to predict writability. A racing file creator
+   cannot be overwritten: the newly appeared CUE is checked for reuse instead.
+3. If an adjacent CUE conflicts, is already in use, or cannot be created, stage
+   matching `Zelda.cue`/`Zelda.flac` in a unique managed cache directory. First
+   try a hard link (no extra audio storage, no symlink privileges). Expected
+   filesystem/volume restrictions trigger a compressed-FLAC copy. Copies are
+   logged with both paths and byte count, space-checked where supported, streamed,
+   and byte-verified before mounting. **`--no-copy` forbids this last resort.**
 
 Prerequisites: Windows 10/11, a working installed ImgDrive, and an existing
 empty visible ImgDrive virtual drive. ImgDrive's vendor documents these Windows
@@ -383,8 +400,9 @@ backend.
 
 ```powershell
 .\build\flaccd.exe drives
-.\build\flaccd.exe mount "C:\Music\Zelda.flac" --drive F:
-.\build\flaccd.exe mount "C:\Music\Zelda.flac" --drive F: --layout text
+.\build\flaccd.exe mount "Y:\temp\music\Zelda.flac" --drive F:
+.\build\flaccd.exe mount "Y:\temp\music\Zelda.flac" --drive F: --layout text
+.\build\flaccd.exe mount "Y:\temp\music\Zelda.flac" --drive F: --no-copy
 .\build\flaccd.exe status
 .\build\flaccd.exe unmount F:
 ```
@@ -403,30 +421,33 @@ No installation directory is guessed and the current directory is not searched
 automatically. An explicitly configured bad path is an error, not a fallback.
 
 ```powershell
-.\build\flaccd.exe mount "C:\Music\Zelda.flac" --drive F: --imgdrive "C:\Actual\ImgDrive.exe"
+.\build\flaccd.exe mount "Y:\temp\music\Zelda.flac" --drive F: --imgdrive "C:\Actual\ImgDrive.exe"
 $env:FLACCD_IMGDRIVE = 'C:\Actual\ImgDrive.exe'
 .\build\flaccd.exe unmount F: --timeout 60
 ```
 
 All commands accept `--imgdrive PATH`, `--cache-dir DIR`, and
 `--timeout SECONDS` (1..600, default 30 per phase). `--layout` and `--drive` apply
-only to mount. `--help` prints syntax. Exit codes are 0 for success, 1 for
+only to mount, as does `--no-copy`. Paths above are examples: always supply your
+actual FLAC and executable paths. `--help` prints syntax. Exit codes are 0 for success, 1 for
 runtime/process/state failures, and 2 for invalid arguments, configuration, or layout selection.
 The executable must be available for commands, including status. Errors include
 Windows/process status and captured diagnostics where available; stderr prints
 executable/cache paths. For troubleshooting, redirect stderr, for example
 `flaccd mount ... 2> mount.log`. No background logging service is installed.
 
-The cache defaults to `%LOCALAPPDATA%\FlacCD\ImgDrive\v1`. Each uniquely named
-mount directory contains an immutable manifest associating source path, CUE,
-and drive letter, plus small phase markers. CUE references are canonical
-absolute UTF-8 paths, reparsed and checked against the source and normalized
-layout before invocation. Spaces and Unicode are retained; quotes/control
-characters and unsupported filenames are rejected. Supported titles, performers,
-ISRC, PRE/DCP, and all stored indexes use the same writer as BIN/CUE exports,
-with exact 75-frame timestamps and no artificial 150-sector shift. Nonzero
-source-less gaps and unrepresentable layouts are rejected. The FLAC must remain
-at its referenced path, unchanged/readable, for the duration of the mount.
+The cache defaults to `%LOCALAPPDATA%\FlacCD\ImgDrive\v1`. A unique mount
+entry records the source, chosen CUE, drive, strategy, file identities, expected
+CUE contents, and phase. An immutable intent is persisted before files are
+created; completed identities are recorded before any ImgDrive invocation.
+Generated CUEs use relative UTF-8 FILE filenames, while ImgDrive receives the
+absolute CUE path. References and normalized layouts are reparsed and validated
+before invocation. Spaces and Unicode are retained; unsafe filenames are rejected.
+Supported titles, performers, ISRC, PRE/DCP, and stored indexes use the shared
+CUE writer, exact 75-frame timestamps, and no artificial 150-sector shift.
+Nonzero source-less gaps and unrepresentable layouts are rejected. Keep source
+and mounted resources unchanged and readable until unmount, including hard-linked
+audio: a hard link is another name for the original data, not a snapshot.
 
 The CUE and state survive CLI exit. The real adapter uses CreateProcessW with
 literal quoted UTF-16 arguments, without a shell; captures bounded diagnostics;
@@ -435,14 +456,28 @@ A per-cache Windows named mutex serializes FlacCD commands and recovers after
 process death. There is no ImgDrive provider SDK or custom sector-serving
 service in this implementation.
 
-Unmount uses the **owned CUE pathname**, not an unconditional drive eject or
-unmount-all command. It deletes only validated files in that mount's owned
-cache directory, after process success and empty/missing drive confirmation.
-Failures/timeouts preserve CUE/state for inspection/retry; an already tracked
-or occupied drive is not replaced. `status` reports recorded phase and current
-media presence separately, without claiming it can query ImgDrive's current
-image identity. Malformed or altered state fails closed; unrelated files and
-unknown entries are never automatically pruned.
+Unmount uses the **recorded CUE pathname**, not an unconditional drive eject
+or unmount-all command. Only after process success and empty/missing-drive
+confirmation does it remove owned resources. Reused CUEs and originals are
+never removed. Adjacent CUE cleanup requires the saved file identity and exact
+contents; modified or replaced files are preserved with a diagnostic. Staged
+resources receive the same identity checks. Cleanup enumerates known files only,
+never recursively removes a user-supplied directory, and refuses unexpected files.
+
+A shared cache lock serializes concurrent commands. Another mount of the same
+FLAC uses a separate staged pair instead of sharing a managed CUE, so unmounting
+one cannot remove another's resources. Use the same cache directory for related
+commands. Do not manipulate the same image/drive concurrently through ImgDrive
+or another application: its CLI provides no cross-application image-identity lock.
+
+Failures/timeouts preserve resources for inspection/retry; process exit alone
+never triggers cleanup. `status` separates recorded phase from current media
+presence. A fresh CLI can recover completed records after a crash/restart and
+perform image-specific unmount; old cache-only records remain readable. An
+interrupted preparation or partial copy remains `preparing`, was never passed
+to ImgDrive, and requires manual ownership inspection before removal. Corrupt
+records, altered resources, and unknown entries fail closed; no automatic orphan
+pruning is attempted. This is not a power-loss durability guarantee.
 
 The native Windows adapter/CLI are CMake targets only on Windows. The separate
 `flaccd-mount` coordinator and process interface are portable for Linux mock
@@ -456,6 +491,6 @@ process argument plans, missing/invalid executables, failures/timeouts, persiste
 state across backend instances, stale/pending recovery, and protection against
 unrelated/altered files. **They do not establish Windows runtime compatibility.**
 The Windows build adds real process-adapter helper tests, requiring no ImgDrive.
-See [WindowsImgDriveTesting.md](WindowsImgDriveTesting.md) for build prerequisites,
+See [WindowsImgDriveTesting.md](docs/historical/WindowsImgDriveTesting.md) for build prerequisites,
 the Windows 10 Zelda checklist, remount/cleanup/no-BIN/hash checks, failure
-recovery, absolute-path/Unicode qualification, and remaining limitations.
+recovery, strategy/copy/Unicode qualification, and remaining limitations.

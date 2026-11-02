@@ -187,4 +187,20 @@ std::string generateFlacCueSheet(const TrackLayout& layout,
    return cue;
 }
 
+std::string generateRelativeFlacCueSheet(const TrackLayout& layout,
+                                         const FlacMetadata& metadata,
+                                         const std::string& sourceName) {
+   validateSource(layout, metadata);
+   if (sourceName.empty() || sourceName == "." || sourceName == ".." ||
+       sourceName.find_first_of("/\\:*?<>|") != std::string::npos) {
+      throw std::invalid_argument("relative FLAC CUE requires one safe filename, without a directory");
+   }
+   const auto cue = makeCue(layout, metadata, sourceName, "WAVE");
+   const auto parsed = parseCueTextMetadata(cue);
+   if (!compareTrackLayouts(layout, TrackLayout::fromText(metadata, parsed)).empty()) {
+      throw std::invalid_argument("relative FLAC CUE does not preserve normalized layout");
+   }
+   return cue;
+}
+
 }

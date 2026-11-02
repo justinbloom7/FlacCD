@@ -13,19 +13,20 @@ namespace {
 
 void printUsage() {
    std::cout << "Usage:\n"
-             << "  flaccd mount FILE.flac --drive D: [--layout native|text|auto]\n"
+             << "  flaccd mount FILE.flac --drive D: [--layout native|text|auto] [--no-copy]\n"
              << "  flaccd unmount D:\n"
              << "  flaccd status\n"
              << "  flaccd drives\n"
              << "Options (after command):\n"
              << "  --imgdrive PATH.exe    Explicit installed executable (or FLACCD_IMGDRIVE)\n"
              << "  --cache-dir DIR        Persistent cache; default LocalAppData/FlacCD/ImgDrive/v1\n"
+             << "  --no-copy              Mount only without a compressed FLAC copy\n"
              << "  --timeout SECONDS      Per-phase timeout, 1..600; default 30\n"
              << "Auto layout rejects conflicts and prefers agreeing native geometry.\n"
              << "Drive auto-selection is disabled until ImgDrive -l output is qualified.\n"
              << "Use flaccd drives and select an existing, empty, visible ImgDrive drive.\n"
-             << "Mounting creates a cached CUE referencing the original FLAC; no BIN is created.\n"
-             << "Unmount affects only a recorded FlacCD CUE, never unrelated media.\n";
+             << "Mounting reuses/creates an adjacent CUE, else stages a hard link or compressed copy.\n"
+             << "No BIN is created. Unmount removes only verified FlacCD-owned resources.\n";
 }
 
 char parseDrive(std::string_view text) {
@@ -81,11 +82,19 @@ int run(const std::vector<std::string>& arguments) {
    std::filesystem::path executable;
    std::filesystem::path cache;
    std::string layout = "auto";
+   bool noCopy = false;
    std::chrono::seconds timeout(30);
    std::set<std::string> seen;
    while (position < arguments.size()) {
       const auto option = arguments[position++];
-      if (!seen.insert(option).second || position == arguments.size()) {
+      if (!seen.insert(option).second) {
+         throw std::invalid_argument("duplicate option: " + option);
+      }
+      if (option == "--no-copy" && command == "mount") {
+         noCopy = true;
+         continue;
+      }
+      if (position == arguments.size()) {
          throw std::invalid_argument("duplicate option or missing value: " + option);
       }
       const auto& value = arguments[position++];
@@ -117,20 +126,24 @@ int run(const std::vector<std::string>& arguments) {
    }
    std::cerr << "ImgDrive: " << flaccd::pathToUtf8(executable) << "\nCache: " << flaccd::pathToUtf8(cache) << '\n';
    flaccd::WindowsImgDriveHost host;
-   flaccd::ImgDriveBackend backend(host, executable, cache, timeout);
+   flaccd::ImgDriveBackend backend(host, executable, cache, timeout, nullptr, [](const std::string& message) {
+      std::cerr << message << '\n';
+   });
    if (command == "mount") {
       const auto record = backend.mount(input, drive, layout, [](const flaccd::MountRecord& pending) {
          const auto cue = flaccd::parseCueTextMetadata(pending.cueText);
          std::cerr << "Original FLAC: " << flaccd::pathToUtf8(pending.sourcePath)
                    << "\nPersistent CUE: " << flaccd::pathToUtf8(pending.cuePath)
                    << "\nFILE reference: \"" << cue.fileName << "\" " << cue.fileType
-                   << "\nSource reference verified readable by FlacCD. No cached audio file is created.\n";
-      });
+                   << "\nStrategy: " << flaccd::mountStrategyName(pending)
+                   << "\nAudio resource: " << flaccd::pathToUtf8(pending.audioPath)
+                   << "\nMatching CUE/audio resources verified before invocation.\n";
+      }, noCopy);
       std::cout << "Mounted " << flaccd::pathToUtf8(record.sourcePath) << " on " << record.drive << ":\n"
                 << "Persistent CUE: " << flaccd::pathToUtf8(record.cuePath) << '\n';
    } else if (command == "unmount") {
       backend.unmount(*drive);
-      std::cout << "Unmount confirmed; owned CUE/state removed.\n";
+      std::cout << "Unmount confirmed; owned resources/state removed; reused user CUE retained.\n";
    } else if (command == "drives") {
       const auto listing = backend.drives();
       std::cout << "ImgDrive -l output (not parsed):\n" << listing;
@@ -145,6 +158,8 @@ int run(const std::vector<std::string>& arguments) {
       for (const auto& item : mounts) {
          std::cout << item.record.drive << ": recorded " << flaccd::mountStateName(item.record.state)
                    << "; " << mediaName(item.media) << "\n  FLAC: " << flaccd::pathToUtf8(item.record.sourcePath)
+                   << "\n  Strategy: " << flaccd::mountStrategyName(item.record)
+                   << "\n  Audio: " << flaccd::pathToUtf8(item.record.audioPath)
                    << "\n  CUE: " << flaccd::pathToUtf8(item.record.cuePath) << '\n';
       }
    }
