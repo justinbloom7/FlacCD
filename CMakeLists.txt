@@ -8,7 +8,14 @@ endif()
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FLAC REQUIRED IMPORTED_TARGET flac>=1.3.3)
 
-add_library(flaccd-core src/FlacMetadataInspector.cpp src/CueTextMetadata.cpp src/TrackLayout.cpp src/CddaSectorReader.cpp src/BinCueExporter.cpp src/CueSheetWriter.cpp src/AudioExporter.cpp src/ExportOutput.cpp)
+# Keep one C++ runtime per application on Windows; do not split the core's
+# exception/allocator ABI across DLLs with independent static GCC runtimes.
+set(flaccdLibraryType "")
+if(WIN32)
+   set(flaccdLibraryType STATIC)
+endif()
+
+add_library(flaccd-core ${flaccdLibraryType} src/FlacMetadataInspector.cpp src/CueTextMetadata.cpp src/TrackLayout.cpp src/CddaSectorReader.cpp src/BinCueExporter.cpp src/CueSheetWriter.cpp src/AudioExporter.cpp src/ExportOutput.cpp)
 target_include_directories(flaccd-core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_compile_features(flaccd-core PUBLIC cxx_std_20)
 set_target_properties(flaccd-core PROPERTIES CXX_EXTENSIONS OFF)
@@ -31,7 +38,7 @@ include(CTest)
 # Mount coordination is platform-neutral for mock tests, separate from core.
 # The real process/device adapter and CLI are built only on Windows.
 if(WIN32 OR BUILD_TESTING)
-   add_library(flaccd-mount src/mount/ImgDriveBackend.cpp
+   add_library(flaccd-mount ${flaccdLibraryType} src/mount/ImgDriveBackend.cpp
                             src/mount/OpticalDrive.cpp
                             src/mount/AgentProtocol.cpp
                             src/mount/MountAgent.cpp
@@ -44,7 +51,7 @@ endif()
 
 if(WIN32)
    target_compile_definitions(flaccd-mount PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
-   add_library(flaccd-imgdrive src/mount/WindowsImgDriveHost.cpp src/mount/WindowsAgentIpc.cpp)
+   add_library(flaccd-imgdrive ${flaccdLibraryType} src/mount/WindowsImgDriveHost.cpp src/mount/WindowsAgentIpc.cpp)
    target_link_libraries(flaccd-imgdrive PUBLIC flaccd-mount PRIVATE advapi32 shell32 ole32 user32 uuid setupapi cfgmgr32)
    target_compile_definitions(flaccd-imgdrive PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
    set_target_properties(flaccd-imgdrive PROPERTIES CXX_EXTENSIONS OFF)
@@ -75,6 +82,30 @@ if(WIN32)
 endif()
 
 if(BUILD_TESTING)
+   # Host binutils can build tiny real PE fixtures without Windows headers,
+   # MinGW runtimes, or executing target code (also useful on native Linux).
+   get_filename_component(toolDirectory "${CMAKE_CXX_COMPILER}" DIRECTORY)
+   find_program(flaccdFixtureAssembler NAMES as HINTS "${toolDirectory}" NO_CMAKE_FIND_ROOT_PATH)
+   if(flaccdFixtureAssembler AND CMAKE_LINKER AND CMAKE_OBJCOPY AND CMAKE_OBJDUMP)
+      execute_process(COMMAND "${CMAKE_LINKER}" -V OUTPUT_VARIABLE linkerEmulations ERROR_QUIET)
+      execute_process(COMMAND "${flaccdFixtureAssembler}" --version OUTPUT_VARIABLE assemblerVersion ERROR_QUIET)
+      if(linkerEmulations MATCHES "i386pep" AND assemblerVersion MATCHES "GNU assembler")
+         add_test(NAME windows-deployment COMMAND "${CMAKE_COMMAND}"
+            "-DsourceRoot=${CMAKE_CURRENT_SOURCE_DIR}"
+            "-DtestDirectory=${CMAKE_CURRENT_BINARY_DIR}/deployment-fixtures"
+            "-Dassembler=${flaccdFixtureAssembler}"
+            "-Dlinker=${CMAKE_LINKER}"
+            "-Dobjcopy=${CMAKE_OBJCOPY}"
+            "-DpeObjdump=${CMAKE_OBJDUMP}"
+            "-DcompilerPath=${CMAKE_CXX_COMPILER}"
+            "-Darchiver=${CMAKE_AR}"
+            "-DhostIsLinux=$<STREQUAL:${CMAKE_HOST_SYSTEM_NAME},Linux>"
+            "-DisCrossCompiling=${CMAKE_CROSSCOMPILING}"
+            "-DfixtureGenerator=${CMAKE_GENERATOR}"
+            "-DcompilerIsGnu=$<STREQUAL:${CMAKE_CXX_COMPILER_ID},GNU>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/WindowsDeploymentTests.cmake")
+      endif()
+   endif()
    add_executable(flaccd-process-diagnostic-tests tests/ProcessArgumentDiagnosticsTests.cpp)
    target_compile_features(flaccd-process-diagnostic-tests PRIVATE cxx_std_20)
    set_target_properties(flaccd-process-diagnostic-tests PROPERTIES CXX_EXTENSIONS OFF)
@@ -189,3 +220,6 @@ if(BUILD_TESTING)
    add_test(NAME cli-no-arguments COMMAND flaccd-info)
    set_tests_properties(cli-no-arguments PROPERTIES WILL_FAIL TRUE)
 endif()
+
+include(cmake/WindowsDeployment.cmake)
+configureWindowsDeployment()

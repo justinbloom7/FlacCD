@@ -41,7 +41,9 @@ ctest --test-dir build-windows --output-on-failure
 ctest --test-dir build-windows -R '^(windows-process|windows-agent-ipc)$' -V
 ```
 
-Keep `flaccd.exe`, `flaccd-agent.exe` and the required runtime DLLs available.
+For delivery outside MSYS2, use the audited folder/ZIP from `flaccd-package`;
+see [WindowsDeployment.md](WindowsDeployment.md). Keep its executables and bundled
+DLLs together. No development-environment PATH is required by the intended package.
 Building target `flaccd` also builds its agent. No WDK/IDE or security setting
 changes are needed. Never run these tests as administrator to mask access errors.
 

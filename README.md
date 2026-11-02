@@ -17,6 +17,14 @@ ctest --test-dir build --output-on-failure
 ./build/flaccd-info /path/to/disc.flac
 ```
 
+For Windows delivery without MSYS2/MinGW installed on the destination machine,
+configure a Release build and run `cmake --build build-windows --target flaccd-package`.
+The audited folder/ZIP contains all five applications and any required non-system
+DLLs. MinGW GCC/C++ runtimes are static by default; winpthreads is static when a
+link probe supports it. Shared libFLAC dependencies are collected recursively.
+See [WindowsDeployment.md](docs/WindowsDeployment.md) for build/package commands,
+import reports, cross-compilation and clean cmd.exe/PowerShell verification.
+
 The `flaccd-core` library exposes owned metadata values through
 `include/flaccd/FlacMetadataInspector.h`. The CLI displays STREAMINFO audio
 parameters, duration, CD-DA format compatibility, native CUESHEET catalog,
