@@ -3,6 +3,7 @@
 #include "flaccd/PathText.h"
 
 #include <fstream>
+#include <iterator>
 #include <stdexcept>
 
 namespace flaccd {
@@ -28,6 +29,34 @@ std::chrono::milliseconds validateTimeout(std::chrono::milliseconds timeout) {
       throw std::invalid_argument("timeout must be greater than zero and no more than ten minutes");
    }
    return timeout;
+}
+
+void validateCachedSource(const MountRecord& record,
+                          const FlacMetadata& metadata,
+                          const TrackLayout& layout) {
+   // Read the file actually handed to ImgDrive, not just the in-memory writer
+   // output. Neither CUE creation nor this check creates a cached audio alias.
+   std::ifstream input(record.cuePath, std::ios::binary);
+   if (!input) {
+      throw std::runtime_error("cannot open cached CUE: " + pathToUtf8(record.cuePath));
+   }
+   const std::string contents{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+   if (input.bad() || contents != record.cueText) {
+      throw std::runtime_error("cached CUE differs from the prepared mount record");
+   }
+   const auto parsed = parseCueTextMetadata(contents);
+   const auto reference = pathFromUtf8(parsed.fileName);
+   if (parsed.fileType != "WAVE" || !reference.is_absolute() ||
+       !compareTrackLayouts(layout, TrackLayout::fromText(metadata, parsed)).empty() ||
+       !std::filesystem::is_regular_file(reference) || !std::filesystem::equivalent(reference, record.sourcePath)) {
+      throw std::runtime_error("cached CUE must reference the original FLAC by its absolute path");
+   }
+   std::ifstream source(reference, std::ios::binary);
+   char signature[4]{};
+   source.read(signature, sizeof(signature));
+   if (!source || std::string_view(signature, sizeof(signature)) != "fLaC") {
+      throw std::runtime_error("cached CUE's original FLAC reference is missing, unreadable, or changed: " + parsed.fileName);
+   }
 }
 
 char normalizeDrive(char drive) {
@@ -65,7 +94,8 @@ ProcessResult ImgDriveBackend::invoke(std::vector<std::string> arguments) {
 
 MountRecord ImgDriveBackend::mount(const std::filesystem::path& source,
                                    std::optional<char> requestedDrive,
-                                   std::string_view layoutSource) {
+                                   std::string_view layoutSource,
+                                   const MountPrepared& prepared) {
    char drive = 0;
    if (requestedDrive) {
       drive = normalizeDrive(*requestedDrive);
@@ -105,6 +135,16 @@ MountRecord ImgDriveBackend::mount(const std::filesystem::path& source,
    // default-drive fallback can replace a different drive accidentally.
    if (runner.inspectDrive(drive) != MediaState::Empty) {
       throw std::runtime_error("drive changed during preparation; prepared CUE retained for safe recovery");
+   }
+   validateCachedSource(record, metadata, layout);
+   if (prepared) {
+      prepared(record);
+      // Diagnostic callbacks may run application code; recheck before handing off.
+      store.validate(record);
+      validateCachedSource(record, metadata, layout);
+      if (runner.inspectDrive(drive) != MediaState::Empty) {
+         throw std::runtime_error("drive changed during preparation; prepared CUE retained for safe recovery");
+      }
    }
    store.mark(record, MountState::Mounting);
    const auto result = invoke({"-m:" + std::string(1, drive), pathToUtf8(record.cuePath)});

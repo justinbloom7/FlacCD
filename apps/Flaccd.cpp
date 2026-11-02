@@ -119,7 +119,13 @@ int run(const std::vector<std::string>& arguments) {
    flaccd::WindowsImgDriveHost host;
    flaccd::ImgDriveBackend backend(host, executable, cache, timeout);
    if (command == "mount") {
-      const auto record = backend.mount(input, drive, layout);
+      const auto record = backend.mount(input, drive, layout, [](const flaccd::MountRecord& pending) {
+         const auto cue = flaccd::parseCueTextMetadata(pending.cueText);
+         std::cerr << "Original FLAC: " << flaccd::pathToUtf8(pending.sourcePath)
+                   << "\nPersistent CUE: " << flaccd::pathToUtf8(pending.cuePath)
+                   << "\nFILE reference: \"" << cue.fileName << "\" " << cue.fileType
+                   << "\nSource reference verified readable by FlacCD. No cached audio file is created.\n";
+      });
       std::cout << "Mounted " << flaccd::pathToUtf8(record.sourcePath) << " on " << record.drive << ":\n"
                 << "Persistent CUE: " << flaccd::pathToUtf8(record.cuePath) << '\n';
    } else if (command == "unmount") {

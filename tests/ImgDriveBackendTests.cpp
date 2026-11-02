@@ -80,6 +80,26 @@ public:
       require(records.size() == 1, "state must be published before invocation");
       require(records[0].state == (arguments[0] == "-u" ? flaccd::MountState::Unmounting : flaccd::MountState::Mounting),
               "phase must persist before process invocation");
+      if (arguments[0] != "-u") {
+         const auto persisted = flaccd::parseCueTextMetadata(readFile(cuePath));
+         const auto reference = flaccd::pathFromUtf8(persisted.fileName);
+         require(persisted.errors.empty() && persisted.fileType == "WAVE" && reference.is_absolute(),
+                 "persisted mount CUE must contain an absolute WAVE reference");
+         require(std::filesystem::equivalent(reference, records[0].sourcePath),
+                 "persisted mount CUE references a different audio file");
+         std::ifstream original(reference, std::ios::binary);
+         char signature[4]{};
+         original.read(signature, sizeof(signature));
+         require(original && std::string_view(signature, sizeof(signature)) == "fLaC",
+                 "mock mounter cannot open original FLAC at process invocation");
+         require(!std::filesystem::exists(cuePath.parent_path() / "disc.flac"), "mount created a disc.flac alias");
+         for (const auto& entry : std::filesystem::directory_iterator(cuePath.parent_path())) {
+            require(!std::filesystem::is_symlink(entry.path()), "normal mount created a cache symlink");
+            require(!std::filesystem::equivalent(entry.path(), reference), "normal mount created an audio hard link");
+            require(!readFile(entry.path()).starts_with("fLaC"), "normal mount copied FLAC into the cache");
+         }
+         pendingCue = cuePath;
+      }
       if (result.exitCode == 0 && !result.timedOut && changeMedia) {
          media = arguments[0] == "-u" ? flaccd::MediaState::Empty : flaccd::MediaState::Ready;
       }
@@ -98,6 +118,15 @@ public:
       return std::make_unique<flaccd::MountLock>();
    }
    void pause(std::chrono::milliseconds) override {
+      if (readyAfterPauses > 0) {
+         require(std::filesystem::exists(pendingCue), "CUE deleted during asynchronous mount completion");
+         const auto parsed = flaccd::parseCueTextMetadata(readFile(pendingCue));
+         require(std::filesystem::is_regular_file(flaccd::pathFromUtf8(parsed.fileName)),
+                 "FLAC reference disappeared after mounter process exit");
+         if (--readyAfterPauses == 0) {
+            media = flaccd::MediaState::Ready;
+         }
+      }
       std::this_thread::sleep_for(std::chrono::milliseconds(1));
    }
 
@@ -105,6 +134,8 @@ public:
    flaccd::MediaState media = flaccd::MediaState::Empty;
    bool layoutMatches = true;
    bool changeMedia = true;
+   int readyAfterPauses = 0;
+   std::filesystem::path pendingCue;
    std::optional<std::vector<char>> available;
    std::vector<std::vector<std::string>> calls;
 };
@@ -118,6 +149,17 @@ void testCue(const std::filesystem::path& source) {
       require(parsed.errors.empty() && parsed.fileType == "WAVE", "FLAC-backed FILE must use WAVE");
       require(std::filesystem::equivalent(flaccd::pathFromUtf8(parsed.fileName), source), "wrong FLAC referenced");
       require(flaccd::pathFromUtf8(parsed.fileName).is_absolute(), "cache CUE must use absolute FLAC reference");
+#ifdef _WIN32
+      // On Windows the generated string itself must be fully qualified, not
+      // merely a drive-relative path that filesystem::equivalent can resolve.
+      const auto& name = parsed.fileName;
+      const bool drivePath = name.size() >= 3 && name[1] == ':' && (name[2] == '\\' || name[2] == '/');
+      const bool uncPath = name.starts_with("\\\\") || name.starts_with("//");
+      require(drivePath || uncPath, "generated FILE must use an absolute Windows drive/UNC path");
+      require(!name.starts_with("\\\\?\\"), "CUE must not contain a Win32 extended-device path prefix");
+      require(name.find("Music & spaces; [音楽 é].flac") != std::string::npos,
+              "Windows FILE reference lost spaces or Unicode filename bytes");
+#endif
       require(cue.find("INDEX 00 00:00:00") != std::string::npos &&
               cue.find("INDEX 01 00:00:02") != std::string::npos, "CUE lost pregap or added two seconds");
       require(parsed.title == "Fixture Album" && parsed.performer == "Fixture Album Artist", "descriptive metadata lost");
@@ -240,6 +282,38 @@ void testFailures(const std::filesystem::path& source,
    expectError([&] { flaccd::ImgDriveBackend bad(missing, parent / "invalid.exe", parent / "invalid"); }, "invalid");
 }
 
+void testAsyncAndPreflight(const std::filesystem::path& source,
+                           const std::filesystem::path& executable,
+                           const std::filesystem::path& cache) {
+   FakeHost host;
+   host.changeMedia = false;
+   host.readyAfterPauses = 2;
+   flaccd::ImgDriveBackend backend(host, executable, cache);
+   bool preparedObserved = false;
+   const auto mounted = backend.mount(source, 'D', "auto", [&](const flaccd::MountRecord& record) {
+      require(host.calls.empty(), "prepared diagnostics must precede process invocation");
+      require(readFile(record.cuePath) == record.cueText, "prepared CUE must already exist on disk");
+      preparedObserved = true;
+   });
+   require(preparedObserved && mounted.state == flaccd::MountState::Mounted && host.readyAfterPauses == 0,
+           "did not wait for asynchronous completion after process exit");
+   host.changeMedia = true;
+   backend.unmount('D');
+   host.calls.clear();
+   const auto moved = source.parent_path() / "source-moved-during-preparation.flac";
+   expectError([&] {
+      backend.mount(source, 'D', "auto", [&](const flaccd::MountRecord&) {
+         std::filesystem::rename(source, moved);
+      });
+   }, "original FLAC");
+   require(host.calls.empty(), "disappearing source reached ImgDrive");
+   std::filesystem::rename(moved, source);
+   const auto pending = backend.status();
+   require(pending.size() == 1 && pending[0].record.state == flaccd::MountState::Prepared &&
+           std::filesystem::exists(pending[0].record.cuePath), "preflight error lost recoverable state/CUE");
+   backend.unmount('D');
+}
+
 void testOwnership(const std::filesystem::path& source, const std::filesystem::path& cache) {
    const auto metadata = flaccd::FlacMetadataInspector{}.inspect(source);
    const auto layout = flaccd::selectTrackLayout(metadata, "auto");
@@ -312,6 +386,7 @@ int main(int argumentCount, char* arguments[]) {
       testLifecycle(source, executable, directory.path / flaccd::pathFromUtf8("cache 音楽 & spaces"));
       testFailures(source, executable, directory.path);
       testOwnership(source, directory.path / "ownership");
+      testAsyncAndPreflight(source, executable, directory.path / "asynchronous");
       FakeHost host;
       flaccd::ImgDriveBackend backend(host, executable, directory.path / "unsupported");
       expectError([&] { backend.mount(fixtures / "fixture-gap.flac", 'D', "text"); }, "source-less");

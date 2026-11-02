@@ -3,12 +3,16 @@
 #include "flaccd/mount/MountStateStore.h"
 #include "flaccd/mount/ProcessRunner.h"
 
+#include <functional>
+
 namespace flaccd {
 
 struct MountStatus {
    MountRecord record;
    MediaState media = MediaState::Unknown;
 };
+
+using MountPrepared = std::function<void(const MountRecord& record)>;
 
 class ImgDriveBackend {
 public:
@@ -18,7 +22,8 @@ public:
                    std::chrono::milliseconds timeout = std::chrono::seconds(30));
    MountRecord mount(const std::filesystem::path& source,
                      std::optional<char> drive = std::nullopt,
-                     std::string_view layoutSource = "auto");
+                     std::string_view layoutSource = "auto",
+                     const MountPrepared& prepared = {});
    void unmount(char drive);
    std::vector<MountStatus> status();
    std::string drives();
