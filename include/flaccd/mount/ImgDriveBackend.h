@@ -27,7 +27,8 @@ public:
                      std::string_view layoutSource = "auto",
                      const MountPrepared& prepared = {},
                      bool noCopy = false);
-   void unmount(char drive);
+   std::string unmount(char drive);
+   std::string cleanupEjected(const MountRecord& record);
    std::vector<MountStatus> status();
    std::string drives();
 

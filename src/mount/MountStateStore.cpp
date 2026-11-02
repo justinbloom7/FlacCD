@@ -59,7 +59,7 @@ void removeMetadata(const std::filesystem::path& directory) {
    // Known files only. Never recurse and never follow a path from a manifest.
    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
       const auto name = pathToUtf8(entry.path().filename());
-      bool known = name == "mount.state" || name == "resources.state";
+      bool known = name == "mount.state" || name == "resources.state" || name == "device.state" || name == "actual.state";
       for (const auto phase : PHASES) {
          known = known || name == mountStateName(phase);
       }
@@ -72,6 +72,8 @@ void removeMetadata(const std::filesystem::path& directory) {
          std::filesystem::remove(directory / mountStateName(phase));
       }
    }
+   std::filesystem::remove(directory / "actual.state");
+   std::filesystem::remove(directory / "device.state");
    std::filesystem::remove(directory / "resources.state");
    std::filesystem::remove(directory / "mount.state");
    std::filesystem::remove(directory / "detached");
@@ -190,6 +192,22 @@ MountRecord MountStateStore::load(const std::filesystem::path& directory) const 
          record.state = phase;
       }
    }
+   for (const auto bindingName : {"device.state", "actual.state"}) {
+      if (mountPathExists(directory / bindingName)) {
+         record.deviceConfirmed = std::string_view(bindingName) == "actual.state";
+         std::istringstream binding(readMountCue(directory / bindingName));
+         std::string id;
+         binding >> id >> record.actualDrive >> std::quoted(record.deviceIdentity) >> std::quoted(record.imgDriveSelector);
+         if (!binding || id != record.id || record.actualDrive < 'D' || record.actualDrive > 'Z' ||
+             record.deviceIdentity.empty() || record.imgDriveSelector != std::string(1, record.actualDrive)) {
+            throw std::runtime_error("invalid optical device binding; resources preserved");
+         }
+         binding >> std::ws;
+         if (!binding.eof()) {
+            throw std::runtime_error("unexpected device binding data");
+         }
+      }
+   }
    return record;
 }
 
@@ -278,6 +296,22 @@ void MountStateStore::mark(const MountRecord& record, MountState state) {
    }
 }
 
+MountRecord MountStateStore::bindDevice(const MountRecord& record,
+                                        char actualDrive,
+                                        const std::string& identity,
+                                        const std::string& selector) {
+   validate(record);
+   if (actualDrive < 'D' || actualDrive > 'Z' || identity.empty() || selector != std::string(1, actualDrive)) {
+      throw std::invalid_argument("invalid device binding");
+   }
+   const auto actual = load(record.entryPath);
+   const auto name = actual.deviceIdentity.empty() ? "device.state" : "actual.state";
+   std::ostringstream text;
+   text << record.id << ' ' << actualDrive << ' ' << std::quoted(identity) << ' ' << std::quoted(selector) << '\n';
+   writeMetadata(actual.entryPath / name, text.str());
+   return load(actual.entryPath);
+}
+
 void MountStateStore::discardEmptyPreparation(const MountRecord& record) {
    const auto actual = load(root / ("mount-" + record.id));
    if (actual.resourcesReady || actual.state != MountState::Preparing) {
@@ -292,7 +326,7 @@ void MountStateStore::removeDetached(const MountRecord& record) {
    if (actual.state != MountState::Detached) {
       throw std::runtime_error("cannot clean a mount without confirmed detachment");
    }
-   std::set<std::string> allowed{"mount.state", "resources.state"};
+   std::set<std::string> allowed{"mount.state", "resources.state", "device.state", "actual.state"};
    for (const auto phase : PHASES) {
       allowed.insert(mountStateName(phase));
    }

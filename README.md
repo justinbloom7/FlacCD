@@ -365,132 +365,96 @@ required by automated tests.
 
 ## ImgDrive mounting backend (Windows)
 
-ImgDrive is the preferred mounting backend. The Windows-only `flaccd.exe`
-mounts a small external CUE beside a FLAC with the **same basename**. Manual
-Windows testing found that the installed ImgDrive looks for `Zelda.flac` beside
-`Zelda.cue`, even when FILE names an absolute path elsewhere. This compatibility
-rule is isolated in the ImgDrive backend; portable export tools remain independent.
-No raw BIN is generated, no original FLAC is modified, and no driver is installed.
-
-The backend selects these strategies in order:
-
-1. Reuse adjacent `Zelda.cue` if its normalized layout matches the embedded
-   layout and its WAVE FILE reference identifies the original `Zelda.flac`.
-   Whitespace, comments, UTF-8 BOM, and formatting may differ. This user-owned
-   CUE is never modified or deleted. Conflicts are reported and preserved.
-2. If absent, exclusively create `Zelda.cue` beside the original FLAC, using
-   `FILE "Zelda.flac" WAVE`. An actual creation failure triggers staging;
-   permission bits are not used to predict writability. A racing file creator
-   cannot be overwritten: the newly appeared CUE is checked for reuse instead.
-3. If an adjacent CUE conflicts, is already in use, or cannot be created, stage
-   matching `Zelda.cue`/`Zelda.flac` in a unique managed cache directory. First
-   try a hard link (no extra audio storage, no symlink privileges). Expected
-   filesystem/volume restrictions trigger a compressed-FLAC copy. Copies are
-   logged with both paths and byte count, space-checked where supported, streamed,
-   and byte-verified before mounting. **`--no-copy` forbids this last resort.**
-
-Prerequisites: Windows 10/11, a working installed ImgDrive, and an existing
-empty visible ImgDrive virtual drive. ImgDrive's vendor documents these Windows
-versions and CUE+FLAC mounting; FlacCD's new wrapper still needs Windows
-qualification. Install/use ImgDrive under its own proprietary licensing terms;
-FlacCD does not redistribute its executable/driver or grant integration or
-redistribution rights. See the [vendor product page](https://www.yubsoft.com/imgdrive/)
-and [licensing FAQ](https://yubsoft.com/faq.html). Alcohol is not the preferred
-backend.
+The Windows `flaccd.exe` CLI now talks to a persistent, unprivileged per-user
+`flaccd-agent.exe`. Keep both executables together. The first command starts the
+agent without a console window; no Windows service, autostart registration,
+installer, driver change, or administrator rights are required. The agent owns
+mount operations, records and external-eject reconciliation. Existing portable
+inspection, decoding and export tools remain independent.
 
 ```powershell
-.\build\flaccd.exe drives
-.\build\flaccd.exe mount "Y:\temp\music\Zelda.flac" --drive F:
-.\build\flaccd.exe mount "Y:\temp\music\Zelda.flac" --drive F: --layout text
-.\build\flaccd.exe mount "Y:\temp\music\Zelda.flac" --drive F: --no-copy
-.\build\flaccd.exe status
-.\build\flaccd.exe unmount F:
+.\build-windows\flaccd.exe drives
+.\build-windows\flaccd.exe mount "Y:\temp\music\Zelda.flac" --drive E:
+.\build-windows\flaccd.exe mount "Y:\temp\music\Zelda.flac" --drive auto --no-copy
+.\build-windows\flaccd.exe status
+.\build-windows\flaccd.exe unmount E:
+.\build-windows\flaccd.exe agent-stop
 ```
 
-Use the actual ImgDrive drive letter, not an arbitrary free drive letter.
-Default layout is `auto`, using the existing validation/conflict policy.
-Automatic drive selection is disabled until reliable enumeration is verified:
-ImgDrive documents `-l`, but the user's installed build shows its drive ID and
-letter in a popup, without a machine-readable console result. `drives` invokes
-that vendor listing; close the popup if needed. `mount FILE.flac` without
-`--drive` returns a clear explanation rather than assuming drive 1 is empty.
+Supply your actual FLAC path and actual ImgDrive drive letter. `--drive` may be
+omitted for automatic selection of a visible, identified, empty ImgDrive device.
+An explicitly requested physical, occupied, hidden or unidentified drive is
+refused. FlacCD does not allocate or change drive letters. Keep ImgDrive's
+**Hide Empty Drives disabled** for reliable selection/eject reconciliation.
 
-Executable discovery checks `--imgdrive`, `FLACCD_IMGDRIVE`, registered Windows
-App Paths (per-user/machine and 32/64-bit views), then absolute PATH directories.
-No installation directory is guessed and the current directory is not searched
-automatically. An explicitly configured bad path is an error, not a fallback.
+ImgDrive's [published CLI](https://www.yubsoft.com/imgdrive/help.html) distinguishes
+letters, numeric IDs and tags. FlacCD uses documented **letter selectors**
+(`-m:E`), not an inferred numeric device index. Windows device numbers and SCSI
+addresses are never treated as ImgDrive IDs. Enumeration joins CDROM interfaces
+to drive letters with `IOCTL_STORAGE_GET_DEVICE_NUMBER`, persists the PnP device
+identity, and checks for an `ImgDrive` driver service in its PnP ancestry.
+Unrecognized service names/versions fail closed with enumeration diagnostics.
+This native identification policy still requires qualification on the installed
+ImgDrive build; the agent does not scrape its `-l` popup.
 
-```powershell
-.\build\flaccd.exe mount "Y:\temp\music\Zelda.flac" --drive F: --imgdrive "C:\Actual\ImgDrive.exe"
-$env:FLACCD_IMGDRIVE = 'C:\Actual\ImgDrive.exe'
-.\build\flaccd.exe unmount F: --timeout 60
-```
+Before/after snapshots and matching audio-CD TOCs confirm the actual device.
+A ready-but-different TOC is reported separately from absent media. If the
+expected TOC appears on another formerly empty ImgDrive device, mount returns
+an explicit drive-selection error, retains resources, and records that observed
+binding for status/recovery. It never reports that as success on the requested
+letter. `unmount` addresses a managed actual device and invokes **image-specific**
+`-u <CUE>`; it never issues unmount-all or unconditional drive eject.
 
-All commands accept `--imgdrive PATH`, `--cache-dir DIR`, and
-`--timeout SECONDS` (1..600, default 30 per phase). `--layout` and `--drive` apply
-only to mount, as does `--no-copy`. Paths above are examples: always supply your
-actual FLAC and executable paths. `--help` prints syntax. Exit codes are 0 for success, 1 for
-runtime/process/state failures, and 2 for invalid arguments, configuration, or layout selection.
-The executable must be available for commands, including status. Errors include
-Windows/process status and captured diagnostics where available; stderr prints
-executable/cache paths. For troubleshooting, redirect stderr, for example
-`flaccd mount ... 2> mount.log`. No background logging service is installed.
+The CUE strategies remain:
 
-The cache defaults to `%LOCALAPPDATA%\FlacCD\ImgDrive\v1`. A unique mount
-entry records the source, chosen CUE, drive, strategy, file identities, expected
-CUE contents, and phase. An immutable intent is persisted before files are
-created; completed identities are recorded before any ImgDrive invocation.
-Generated CUEs use relative UTF-8 FILE filenames, while ImgDrive receives the
-absolute CUE path. References and normalized layouts are reparsed and validated
-before invocation. Spaces and Unicode are retained; unsafe filenames are rejected.
-Supported titles, performers, ISRC, PRE/DCP, and stored indexes use the shared
-CUE writer, exact 75-frame timestamps, and no artificial 150-sector shift.
-Nonzero source-less gaps and unrepresentable layouts are rejected. Keep source
-and mounted resources unchanged and readable until unmount, including hard-linked
-audio: a hard link is another name for the original data, not a snapshot.
+1. Reuse an equivalent matching adjacent user CUE unchanged, comparing normalized
+   layouts and validating its FILE target.
+2. Exclusively create a matching adjacent CUE with `FILE "Zelda.flac" WAVE`.
+3. On conflict, creation denial or concurrent use, stage matching filenames in
+   the managed cache: hard link first, compressed-FLAC copy as a last resort.
+   `--no-copy` prohibits copying. Copies are logged, space-checked where possible,
+   streamed and byte-verified. No decoded BIN is generated.
 
-The CUE and state survive CLI exit. The real adapter uses CreateProcessW with
-literal quoted UTF-16 arguments, without a shell; captures bounded diagnostics;
-and waits for optical readiness plus matching TOC track starts/flags/lead-out.
-A per-cache Windows named mutex serializes FlacCD commands and recovers after
-process death. There is no ImgDrive provider SDK or custom sector-serving
-service in this implementation.
+Generated CUEs preserve supported metadata/indexes and exact file-relative
+75-frame timestamps without a 150-sector shift. Source-less gaps and layouts
+that cannot be represented accurately are rejected. Never edit/rename mounted
+resources or the original source; a hard link shares the original file data.
 
-Unmount uses the **recorded CUE pathname**, not an unconditional drive eject
-or unmount-all command. Only after process success and empty/missing-drive
-confirmation does it remove owned resources. Reused CUEs and originals are
-never removed. Adjacent CUE cleanup requires the saved file identity and exact
-contents; modified or replaced files are preserved with a diagnostic. Staged
-resources receive the same identity checks. Cleanup enumerates known files only,
-never recursively removes a user-supplied directory, and refuses unexpected files.
+All commands accept `--imgdrive PATH.exe`, `--cache-dir DIR`, and
+`--timeout SECONDS` (1..600 per phase). Executable discovery checks explicit
+configuration, `FLACCD_IMGDRIVE`, App Paths, and absolute PATH directories.
+`--layout native|text|auto` and `--no-copy` apply to mount. Auto layout reports
+conflicting embedded layouts. A running agent has one executable/cache
+configuration; use `agent-stop` before changing it. Agent-stop retains mounts;
+the next CLI command starts a new agent and reconciles completed records.
 
-A shared cache lock serializes concurrent commands. Another mount of the same
-FLAC uses a separate staged pair instead of sharing a managed CUE, so unmounting
-one cannot remove another's resources. Use the same cache directory for related
-commands. Do not manipulate the same image/drive concurrently through ImgDrive
-or another application: its CLI provides no cross-application image-identity lock.
+The default cache is `%LOCALAPPDATA%\FlacCD\ImgDrive\v1`. Immutable ownership
+intents, resource identities and phase/device records survive CLI/agent exit.
+User CUEs and original FLACs are never deleted. Generated-file cleanup requires
+unchanged identities and, for CUEs, exact contents. Modified/replaced files and
+unknown cache contents are preserved with diagnostics. Cleanup messages name
+what was actually removed or retained.
 
-Failures/timeouts preserve resources for inspection/retry; process exit alone
-never triggers cleanup. `status` separates recorded phase from current media
-presence. A fresh CLI can recover completed records after a crash/restart and
-perform image-specific unmount; old cache-only records remain readable. An
-interrupted preparation or partial copy remains `preparing`, was never passed
-to ImgDrive, and requires manual ownership inspection before removal. Corrupt
-records, altered resources, and unknown entries fail closed; no automatic orphan
-pruning is attempted. This is not a power-loss durability guarantee.
+A hidden **top-level** window receives `WM_DEVICECHANGE`; the agent also rescans
+every five seconds. Notifications request inspection, not immediate deletion.
+Two empty-media observations of the same identified device, at least five
+seconds apart, permit ownership-checked cleanup. Normal idle eject cleanup takes
+about **5–10 seconds**; long operations can defer it. Missing/unknown devices,
+unconfirmed mounts, legacy unbound records and interrupted preparations are
+preserved for inspection. There is no automatic unsafe orphan pruning.
 
-The native Windows adapter/CLI are CMake targets only on Windows. The separate
-`flaccd-mount` coordinator and process interface are portable for Linux mock
-tests; the core has no Windows API dependency. FLAC metadata inspection now uses
-standard path-aware stream callbacks so Windows filenames are not narrowed
-through an ANSI code page. CDDA decoding and fallback exports retain their
-existing interfaces.
+The local versioned named-pipe interface restricts access to the current user,
+rejects remote clients, validates peer ownership, serializes requests, and returns
+structured status rows alongside output/diagnostics. Its framing and portable
+coordinator are usable by a future GUI. No request is automatically replayed
+after submission if a connection fails. Logs rotate in `agent.log` and
+`agent.previous.log` inside the cache; capture CLI errors with `2> mount.log`.
 
-Linux tests cover FLAC-backed CUE round trips, Unicode/spaces, supported metadata,
-process argument plans, missing/invalid executables, failures/timeouts, persistent
-state across backend instances, stale/pending recovery, and protection against
-unrelated/altered files. **They do not establish Windows runtime compatibility.**
-The Windows build adds real process-adapter helper tests, requiring no ImgDrive.
-See [WindowsImgDriveTesting.md](docs/historical/WindowsImgDriveTesting.md) for build prerequisites,
-the Windows 10 Zelda checklist, remount/cleanup/no-BIN/hash checks, failure
-recovery, strategy/copy/Unicode qualification, and remaining limitations.
+Windows 10/11 and an independently installed, working ImgDrive are prerequisites.
+ImgDrive remains proprietary and is not redistributed. The agent does not provide
+a custom sector server or establish full MMC/subchannel/CD-TEXT fidelity.
+**Native mapping, IPC and eject notifications have not been tested against
+ImgDrive in this Linux development session.** Follow
+[WindowsAgentTesting.md](docs/WindowsAgentTesting.md) for Windows builds, evidence
+collection, IPC tests, restart/eject checks and remaining limitations. Previous
+investigation notes remain under `docs/historical/`.

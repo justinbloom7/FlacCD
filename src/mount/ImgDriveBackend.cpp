@@ -156,8 +156,17 @@ MountRecord ImgDriveBackend::mount(const std::filesystem::path& source,
          throw std::runtime_error("no available ImgDrive virtual drive");
       }
    }
+   const auto before = runner.opticalDrives();
+   if (log) {
+      log("Optical drives before mount:\n" + describeDrives(before));
+   }
+   const auto* target = findDrive(before, drive);
+   if (!target || !target->imgDrive || target->identity.empty()) {
+      throw std::runtime_error("requested drive " + std::string(1, drive) +
+                               ": is not an identified ImgDrive device; select an empty ImgDrive drive:\n" + describeDrives(before));
+   }
    for (const auto& record : store.records()) {
-      if (record.drive == drive) {
+      if (record.drive == drive || record.actualDrive == drive || record.deviceIdentity == target->identity) {
          throw std::runtime_error("drive already has FlacCD state (" + mountStateName(record.state) +
                                   "); use flaccd status or flaccd unmount before remounting");
       }
@@ -169,7 +178,8 @@ MountRecord ImgDriveBackend::mount(const std::filesystem::path& source,
    const auto original = std::filesystem::canonical(source);
    const auto metadata = FlacMetadataInspector{}.inspect(original);
    const auto layout = selectTrackLayout(metadata, layoutSource);
-   const auto record = prepare(drive, original, metadata, layout, noCopy);
+   auto record = prepare(drive, original, metadata, layout, noCopy);
+   record = store.bindDevice(record, drive, target->identity, target->selector());
    store.validate(record);
    validateResources(record, metadata, layout, files);
    if (prepared) {
@@ -177,23 +187,65 @@ MountRecord ImgDriveBackend::mount(const std::filesystem::path& source,
       store.validate(record);
       validateResources(record, metadata, layout, files);
    }
-   if (runner.inspectDrive(drive) != MediaState::Empty) {
-      throw std::runtime_error("drive changed during preparation; resources retained for recovery");
+   const auto preflight = runner.opticalDrives();
+   const auto* selected = findDrive(preflight, drive);
+   if (!selected || selected->identity != target->identity || !selected->imgDrive || selected->media != MediaState::Empty) {
+      throw std::runtime_error("drive identity/media changed during preparation; resources retained for recovery");
    }
    store.mark(record, MountState::Mounting);
-   const auto result = invoke({"-m:" + std::string(1, drive), pathToUtf8(record.cuePath)});
+   if (log) {
+      log("Mount plan: requested=" + std::string(1, drive) + ": identity=" + record.deviceIdentity +
+          " selector=-m:" + record.imgDriveSelector + "\nCUE: " + pathToUtf8(record.cuePath) +
+          "\nAudio: " + pathToUtf8(record.audioPath));
+   }
+   const auto result = invoke({"-m:" + record.imgDriveSelector, pathToUtf8(record.cuePath)});
    const auto deadline = std::chrono::steady_clock::now() + timeout;
+   unsigned mismatchCount = 0;
+   bool readySeen = false;
+   std::string tocDiagnostic;
    do {
-      if (runner.inspectDrive(drive) == MediaState::Ready && runner.matchesLayout(drive, layout)) {
-         store.mark(record, MountState::Mounted);
-         auto mounted = record;
-         mounted.state = MountState::Mounted;
-         return mounted;
+      const auto after = runner.opticalDrives();
+      const auto* actual = findDevice(after, record.deviceIdentity);
+      if (actual && actual->imgDrive && actual->media == MediaState::Ready) {
+         readySeen = true;
+         if (runner.matchesLayout(actual->letter, layout)) {
+            if (actual->letter != drive) {
+               store.bindDevice(record, actual->letter, actual->identity, actual->selector());
+               throw std::runtime_error("drive-selection error: requested " + std::string(1, drive) +
+                                        ": but device is now " + actual->letter + ":; resources retained; use unmount " +
+                                        actual->letter + ":\n" + describeDrives(after));
+            }
+            record = store.bindDevice(record, actual->letter, actual->identity, actual->selector());
+            store.mark(record, MountState::Mounted);
+            record.state = MountState::Mounted;
+            if (log) {
+               log("Optical drives after confirmed mount:\n" + describeDrives(after));
+            }
+            return record;
+         }
+         tocDiagnostic = runner.layoutDiagnostic();
+         ++mismatchCount;
       }
-      runner.pause(std::chrono::milliseconds(50));
+      for (const auto& other : after) {
+         const auto* prior = findDevice(before, other.identity);
+         if (other.letter != drive && other.imgDrive && other.media == MediaState::Ready &&
+             prior && prior->media == MediaState::Empty && runner.matchesLayout(other.letter, layout)) {
+            store.bindDevice(record, other.letter, other.identity, other.selector());
+            throw std::runtime_error("drive-selection error: requested " + std::string(1, drive) +
+                                     ":; expected TOC appeared on " + other.letter +
+                                     ": instead. No success reported; resources retained. Use unmount " + other.letter +
+                                     ": after inspecting status.\n" + describeDrives(after));
+         }
+      }
+      if (mismatchCount >= 3) {
+         throw std::runtime_error("mount verification: media ready but audio-CD TOC mismatch; resources retained. " +
+                                  tocDiagnostic + "\n" + describeDrives(after));
+      }
+      runner.pause(std::chrono::milliseconds(100));
    } while (std::chrono::steady_clock::now() < deadline);
-   throw std::runtime_error("mount not confirmed: optical drive/TOC did not match before timeout; "
-                            "CUE and mounting state retained; use flaccd status/unmount; ImgDrive output: " + result.diagnostics);
+   throw std::runtime_error(std::string("mount not confirmed: ") + (readySeen ? "TOC unavailable/mismatched" : "media never became ready") +
+                            "; CUE/state retained; ImgDrive output: " + result.diagnostics +
+                            "\nOptical drives after mount:\n" + describeDrives(runner.opticalDrives()));
 }
 
 MountRecord ImgDriveBackend::prepare(char drive,
@@ -288,52 +340,119 @@ MountRecord ImgDriveBackend::prepare(char drive,
    return store.complete(intent, storage);
 }
 
-void ImgDriveBackend::unmount(char requestedDrive) {
+std::string ImgDriveBackend::cleanupEjected(const MountRecord& record) {
+   store.validate(record);
+   const auto drives = runner.opticalDrives();
+   const auto* actual = findDevice(drives, record.deviceIdentity);
+   if (!actual || !actual->imgDrive || actual->media != MediaState::Empty || record.deviceIdentity.empty()) {
+      throw std::runtime_error("cleanup deferred: actual device is missing, changed, occupied, or uncertain");
+   }
+   if (record.state == MountState::Preparing || record.state == MountState::Prepared || record.state == MountState::Mounting) {
+      throw std::runtime_error("cleanup deferred: mount was never confirmed; pending resources preserved");
+   }
+   const bool cuePresent = mountPathExists(record.cuePath);
+   const bool audioPresent = record.location == CueLocation::Staged && mountPathExists(record.audioPath);
+   store.mark(record, MountState::Detached);
+   store.removeDetached(record);
+   std::string result = "Detached " + std::string(1, actual->letter) + ":; ";
+   if (record.location == CueLocation::Existing) {
+      result += "user CUE retained: " + pathToUtf8(record.cuePath);
+   } else if (cuePresent) {
+      result += "removed generated CUE: " + pathToUtf8(record.cuePath);
+   } else {
+      result += "generated CUE already absent";
+   }
+   if (audioPresent) {
+      result += "\nRemoved staged " + std::string(record.storage == AudioStorage::Copy ? "compressed copy: " : "hard link: ") +
+                pathToUtf8(record.audioPath);
+   }
+   return result + "\nMount state removed; original FLAC retained.\n";
+}
+
+std::string ImgDriveBackend::unmount(char requestedDrive) {
    const auto drive = normalizeDrive(requestedDrive);
    std::optional<MountRecord> selected;
+   const auto currentDrives = runner.opticalDrives();
    for (const auto& record : store.records()) {
-      if (record.drive == drive) {
+      const auto* current = findDevice(currentDrives, record.deviceIdentity);
+      if (current && current->letter == drive) {
          if (selected) {
-            throw std::runtime_error("ambiguous mount records; refusing to unmount");
+            throw std::runtime_error("ambiguous actual-device records; refusing to unmount");
          }
          selected = record;
       }
    }
    if (!selected) {
-      throw std::runtime_error("no FlacCD-owned mount for this drive; unrelated media will not be ejected");
+      throw std::runtime_error("no FlacCD-owned mount bound to this actual drive; inspect status (legacy/unverified records need manual recovery)");
    }
-   const auto& record = *selected;
+   auto record = *selected;
    store.validate(record);
    if (record.state == MountState::Preparing) {
-      throw std::runtime_error("preparation never reached ImgDrive; incomplete resources preserved for ownership inspection");
+      throw std::runtime_error("preparation never reached ImgDrive; resources preserved for ownership inspection");
    }
+   auto drives = runner.opticalDrives();
+   const auto* actual = findDevice(drives, record.deviceIdentity);
+   if (!actual || !actual->imgDrive) {
+      throw std::runtime_error("recorded optical device unavailable; no unmount issued; resources retained\n" + describeDrives(drives));
+   }
+   if (actual->media == MediaState::Unknown || actual->media == MediaState::Missing) {
+      throw std::runtime_error("actual device state uncertain; resources retained");
+   }
+   const bool uncertainTarget = !record.deviceConfirmed;
+   const auto beforeUnmount = drives;
    store.mark(record, MountState::Unmounting);
-   // Vendor-documented image-specific unmount, never bare -u or -u:D.
-   const auto result = invoke({"-u", pathToUtf8(record.cuePath)});
+   record.state = MountState::Unmounting;
+   if (uncertainTarget || actual->media != MediaState::Empty) {
+      // Image-specific selector: never eject a drive merely because its letter
+      // resembles a stale request, and never unmount all ImgDrive images.
+      invoke({"-u", pathToUtf8(record.cuePath)});
+   }
    const auto deadline = std::chrono::steady_clock::now() + timeout;
    do {
-      const auto media = runner.inspectDrive(drive);
-      if (media == MediaState::Empty || media == MediaState::Missing) {
-         store.mark(record, MountState::Detached);
-         store.removeDetached(record);
-         return;
+      drives = runner.opticalDrives();
+      actual = findDevice(drives, record.deviceIdentity);
+      bool empty = actual && actual->imgDrive && actual->media == MediaState::Empty;
+      if (uncertainTarget) {
+         // Without an observed TOC binding, the original selector may have
+         // fallen back elsewhere. An empty requested drive alone proves nothing.
+         // Image-specific unmount must succeed and every visible optical
+         // device must be accounted for and empty; unrelated media is untouched.
+         for (const auto& prior : beforeUnmount) {
+            const auto* current = findDevice(drives, prior.identity);
+            if (!current || current->media != MediaState::Empty) {
+               empty = false;
+            }
+         }
+         for (const auto& current : drives) {
+            if (current.media != MediaState::Empty) {
+               empty = false;
+            }
+         }
       }
-      runner.pause(std::chrono::milliseconds(50));
+      if (empty) {
+         return cleanupEjected(record);
+      }
+      runner.pause(std::chrono::milliseconds(100));
    } while (std::chrono::steady_clock::now() < deadline);
-   throw std::runtime_error("unmount not confirmed: drive still has media or status is unknown; "
-                            "CUE/state retained; ImgDrive output: " + result.diagnostics);
+   throw std::runtime_error("unmount not confirmed on actual device; CUE/state retained\n" + describeDrives(drives));
 }
 
 std::vector<MountStatus> ImgDriveBackend::status() {
    std::vector<MountStatus> result;
    for (const auto& record : store.records()) {
-      result.push_back({record, runner.inspectDrive(record.drive)});
+      const auto drives = runner.opticalDrives();
+      const auto* actual = findDevice(drives, record.deviceIdentity);
+      auto observed = record;
+      if (actual) {
+         observed.actualDrive = actual->letter;
+      }
+      result.push_back({observed, actual ? actual->media : MediaState::Unknown});
    }
    return result;
 }
 
 std::string ImgDriveBackend::drives() {
-   return invoke({"-l"}).diagnostics;
+   return describeDrives(runner.opticalDrives());
 }
 
 }

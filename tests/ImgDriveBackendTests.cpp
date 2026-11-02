@@ -1,4 +1,5 @@
 #include "flaccd/mount/ImgDriveBackend.h"
+#include "flaccd/mount/MountAgent.h"
 #include "flaccd/CueSheetWriter.h"
 #include "flaccd/PathText.h"
 
@@ -12,6 +13,7 @@
 #include <mutex>
 #include <random>
 #include <sstream>
+#include <set>
 #include <thread>
 
 namespace {
@@ -147,15 +149,25 @@ public:
          require(std::filesystem::equivalent(audio, found->audioPath), "wrong audio resource");
          require(readFile(audio).starts_with("fLaC"), "mock mounter cannot read FLAC");
          pendingCue = cue;
-         pendingDrive = found->drive;
+         pendingDrive = redirectDrive ? redirectDrive : found->drive;
       }
       if (result.exitCode == 0 && !result.timedOut && changeMedia) {
-         media[found->drive] = unmount ? flaccd::MediaState::Empty : flaccd::MediaState::Ready;
+         media[unmount ? found->actualDrive : (redirectDrive ? redirectDrive : found->drive)] = unmount ? flaccd::MediaState::Empty : flaccd::MediaState::Ready;
       }
       return result;
    }
    flaccd::MediaState inspectDrive(char drive) override {
       return media.contains(drive) ? media.at(drive) : flaccd::MediaState::Empty;
+   }
+   std::vector<flaccd::OpticalDrive> opticalDrives() override {
+      std::vector<flaccd::OpticalDrive> drives;
+      for (char drive = 'D'; drive <= 'F'; ++drive) {
+         if (!missing.contains(drive)) {
+            drives.push_back({drive, "mock-device-" + std::string(1, drive) + identitySuffix, "test",
+                              !physical.contains(drive), inspectDrive(drive)});
+         }
+      }
+      return drives;
    }
    bool matchesLayout(char, const flaccd::TrackLayout&) override {
       return layoutMatches;
@@ -181,6 +193,10 @@ public:
    std::filesystem::path cache;
    std::recursive_mutex mutex;
    flaccd::ProcessResult result;
+   char redirectDrive = 0;
+   std::string identitySuffix;
+   std::set<char> physical;
+   std::set<char> missing;
    bool changeMedia = true;
    bool layoutMatches = true;
    int readyAfterPauses = 0;
@@ -595,6 +611,155 @@ void testQuoting() {
 }
 
 
+void testDriveMapping(const std::filesystem::path& fixtures) {
+   {
+      Scenario s(fixtures);
+      s.host.physical.insert('D');
+      auto backend = s.backend();
+      expectError([&] { backend->mount(s.source, 'D'); }, "not an identified ImgDrive");
+      require(s.host.calls.empty() && !std::filesystem::exists(s.files.adjacent), "physical drive received a mount");
+      s.host.media['E'] = flaccd::MediaState::Ready;
+      expectError([&] { backend->mount(s.source, 'E'); }, "occupied");
+      require(s.host.calls.empty(), "occupied drive received a mount");
+      s.host.media['E'] = flaccd::MediaState::Empty;
+      s.host.available = std::vector<char>{'E'};
+      const auto record = backend->mount(s.source);
+      require(record.drive == 'E' && record.actualDrive == 'E' && record.imgDriveSelector == "E" &&
+              record.deviceIdentity == "mock-device-E", "automatic drive binding wrong");
+      const auto message = backend->unmount('E');
+      require(message.find("removed generated CUE") != std::string::npos &&
+              message.find("user CUE retained") == std::string::npos, "generated CUE cleanup misreported");
+   }
+   {
+      Scenario s(fixtures);
+      s.host.redirectDrive = 'E';
+      auto backend = s.backend();
+      expectError([&] { backend->mount(s.source, 'D'); }, "drive-selection error");
+      const auto pending = backend->status();
+      require(pending.size() == 1 && pending[0].record.drive == 'D' && pending[0].record.actualDrive == 'E' &&
+              pending[0].record.deviceIdentity == "mock-device-E" && std::filesystem::exists(s.files.adjacent),
+              "wrong-drive mount lost actual binding/resources");
+      expectError([&] { backend->unmount('D'); }, "no FlacCD-owned");
+      backend->unmount('E');
+      require(s.host.media['E'] == flaccd::MediaState::Empty, "actual device did not unmount");
+   }
+   {
+      Scenario s(fixtures);
+      s.host.layoutMatches = false;
+      auto backend = s.backend();
+      expectError([&] { backend->mount(s.source, 'D'); }, "TOC mismatch");
+      require(std::filesystem::exists(s.files.adjacent), "TOC mismatch deleted uncertain resources");
+   }
+   {
+      Scenario s(fixtures);
+      s.host.result = {7, false, "vendor returned before target was identified"};
+      auto backend = s.backend(std::chrono::milliseconds(2));
+      expectError([&] { backend->mount(s.source, 'D'); }, "failed");
+      s.host.media['E'] = flaccd::MediaState::Ready;
+      s.host.result = {};
+      expectError([&] { backend->unmount('D'); }, "not confirmed");
+      require(std::filesystem::exists(s.files.adjacent) && s.host.media['E'] == flaccd::MediaState::Ready,
+              "empty requested drive permitted deletion while actual target was uncertain");
+      s.host.media['E'] = flaccd::MediaState::Empty;
+      backend->unmount('D');
+   }
+
+}
+
+flaccd::AgentReply ipc(flaccd::MountAgent& agent, const std::vector<std::string>& arguments) {
+   return flaccd::decodeAgentReply(flaccd::encodeAgentReply(agent.handle(
+      flaccd::decodeAgentRequest(flaccd::encodeAgentRequest(arguments)))));
+}
+
+void testAgent(const std::filesystem::path& fixtures) {
+   Scenario s(fixtures);
+   auto agent = std::make_unique<flaccd::MountAgent>(s.host, s.executable, s.host.cache);
+   auto mounted = ipc(*agent, {"mount", flaccd::pathToUtf8(s.source), "--drive", "D:", "--no-copy"});
+   require(mounted.exitCode == 0 && mounted.records.size() == 1 && mounted.records[0][2] == "D",
+           "IPC mount/status structure wrong");
+   const auto now = std::chrono::steady_clock::now();
+   s.host.media['D'] = flaccd::MediaState::Empty; // Explorer eject, no CLI unmount.
+   require(agent->reconcile(now).empty() && std::filesystem::exists(s.files.adjacent), "single notification deleted CUE");
+   s.host.media['D'] = flaccd::MediaState::Unknown;
+   require(agent->reconcile(now + std::chrono::seconds(6)).empty() && std::filesystem::exists(s.files.adjacent),
+           "uncertain media permitted cleanup");
+   s.host.media['D'] = flaccd::MediaState::Empty;
+   agent.reset();
+   agent = std::make_unique<flaccd::MountAgent>(s.host, s.executable, s.host.cache);
+   agent->reconcile(now + std::chrono::seconds(7));
+   require(std::filesystem::exists(s.files.adjacent), "restart bypassed debounce");
+   // No notification: periodic reconciliation alone must recover the eject.
+   const auto cleanup = agent->reconcile(now + std::chrono::seconds(13));
+   require(cleanup.find("removed generated CUE") != std::string::npos && !std::filesystem::exists(s.files.adjacent),
+           "missed eject/restart recovery failed");
+   require(ipc(*agent, {"status"}).records.empty(), "ejected record not removed");
+   writeFile(s.files.adjacent, s.cue());
+   require(ipc(*agent, {"mount", flaccd::pathToUtf8(s.source), "--drive", "E:"}).exitCode == 0, "agent remount failed");
+   const auto unmount = ipc(*agent, {"unmount", "E:"});
+   require(unmount.exitCode == 0 && unmount.output.find("user CUE retained") != std::string::npos &&
+           std::filesystem::exists(s.files.adjacent), "agent removed/misreported user CUE");
+
+   std::array<flaccd::AgentReply, 2> replies;
+   std::thread first([&] { replies[0] = ipc(*agent, {"mount", flaccd::pathToUtf8(s.source), "--drive", "D:"}); });
+   std::thread second([&] { replies[1] = ipc(*agent, {"mount", flaccd::pathToUtf8(s.source), "--drive", "E:"}); });
+   first.join();
+   second.join();
+   require(replies[0].exitCode == 0 && replies[1].exitCode == 0, "concurrent agent clients failed");
+   require(ipc(*agent, {"status"}).records.size() == 2, "concurrent IPC lost a mount");
+   s.host.media['D'] = flaccd::MediaState::Empty;
+   s.host.media['E'] = flaccd::MediaState::Empty;
+   agent->reconcile(now + std::chrono::seconds(20));
+   agent->reconcile(now + std::chrono::seconds(26));
+   require(ipc(*agent, {"status"}).records.empty() && readFile(s.files.adjacent) == s.cue(),
+           "concurrent eject cleanup deleted shared user resource");
+   require(ipc(*agent, {"mount", "relative.flac"}).exitCode == 2, "relative IPC source accepted");
+   s.unchanged();
+}
+
+void testAgentUncertain(const std::filesystem::path& fixtures) {
+   for (int variant = 0; variant < 5; ++variant) {
+      Scenario s(fixtures);
+      flaccd::MountAgent agent(s.host, s.executable, s.host.cache);
+      if (variant == 0) {
+         s.host.result = {7, false, "uncertain launch"};
+      }
+      const auto reply = ipc(agent, {"mount", flaccd::pathToUtf8(s.source), "--drive", "D:"});
+      require((variant == 0) == (reply.exitCode != 0), "unexpected initial agent mount result");
+      if (variant == 1) {
+         s.host.identitySuffix = "-replaced";
+      } else if (variant == 2) {
+         s.host.missing.insert('D');
+      } else if (variant == 3) {
+         writeFile(s.files.adjacent, "replaced user contents");
+      } else if (variant == 4) {
+         s.host.result = {7, false, "uncertain unmount"};
+         require(ipc(agent, {"unmount", "D:"}).exitCode == 1, "unmount failure not reported");
+      }
+      s.host.media['D'] = flaccd::MediaState::Empty;
+      const auto now = std::chrono::steady_clock::now();
+      agent.reconcile(now);
+      agent.reconcile(now + std::chrono::seconds(6));
+      require(std::filesystem::exists(s.files.adjacent) && !ipc(agent, {"status"}).records.empty(),
+              "uncertain device/mount/ownership was cleaned");
+   }
+}
+
+void testProtocol() {
+   const std::vector<std::string> arguments{"mount", "Y:\\Music with spaces\\音楽 é.flac", "--no-copy"};
+   const auto text = flaccd::encodeAgentRequest(arguments);
+   require(flaccd::decodeAgentRequest(text) == arguments, "IPC lost Windows/Unicode arguments");
+   for (std::size_t size = 0; size < text.size(); ++size) {
+      expectError([&] { flaccd::decodeAgentRequest(std::string_view(text).substr(0, size)); });
+   }
+   expectError([&] { flaccd::decodeAgentRequest(text + "extra"); }, "trailing");
+   expectError([&] { flaccd::decodeAgentRequest(flaccd::encodeAgentRequest({std::string("a\0b", 3)})); }, "NUL");
+   expectError([&] { flaccd::encodeAgentRequest({std::string(flaccd::MAX_AGENT_MESSAGE, 'a')}); }, "large");
+   flaccd::AgentReply reply{2, "output", "diagnostic", {}};
+   const auto result = flaccd::decodeAgentReply(flaccd::encodeAgentReply(reply));
+   require(result.exitCode == 2 && result.output == reply.output && result.diagnostics == reply.diagnostics,
+           "IPC error reply changed");
+}
+
 void testLegacyAndStateValidation(const std::filesystem::path& fixtures) {
    Scenario s(fixtures);
    flaccd::MountStateStore store(s.host.cache);
@@ -625,8 +790,10 @@ void testLegacyAndStateValidation(const std::filesystem::path& fixtures) {
       const auto status = backend->status();
       require(status.size() == 1 && status[0].record.location == flaccd::CueLocation::Legacy &&
               status[0].record.state == flaccd::MountState::Mounted, "legacy state recovery failed");
-      backend->unmount('D');
+      expectError([&] { backend->unmount('D'); }, "legacy/unverified");
    }
+   store.mark(record, flaccd::MountState::Detached);
+   store.removeDetached(record);
    require(!std::filesystem::exists(record.entryPath), "legacy mount cleanup failed");
    s.unchanged();
 
@@ -658,6 +825,10 @@ int main(int argumentCount, char* arguments[]) {
       testValidation(fixtures);
       testOwnedCacheProtection(fixtures);
       testLegacyAndStateValidation(fixtures);
+      testDriveMapping(fixtures);
+      testProtocol();
+      testAgent(fixtures);
+      testAgentUncertain(fixtures);
       std::cout << "ImgDrive strategy, ownership, recovery, race, and filesystem-fallback tests passed\n";
    } catch (const std::exception& error) {
       std::cerr << error.what() << '\n';
