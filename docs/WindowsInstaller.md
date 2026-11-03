@@ -34,6 +34,10 @@ packages and end-user installation prerequisites. It creates
 version. Change `project(FlacCD VERSION ...)` in `CMakeLists.txt` for future
 MAJOR.MINOR.PATCH releases; keep the installer's AppId stable across upgrades.
 Installer metadata, filename and version comparison use that CMake version.
+`cmake/ProductMetadata.cmake` supplies publisher **Evenstar Systems** and product
+**FlacCD** to installer/ARP metadata and all five executable VERSIONINFO resources.
+Each executable has its own FileDescription; `windows-version-metadata` checks
+the actual Windows resources using PowerShell's FileVersionInfo API.
 
 `flaccd-installer` depends on `flaccd-smoke`, which stages all five end-user
 executables, resolves runtime DLLs, audits direct/transitive PE dependencies, and
@@ -89,6 +93,19 @@ installation location and uninstall record. Same-version reinstall is supported;
 older-version installation is refused. An Explorer registration owned by another
 FlacCD location blocks install; first run `shell uninstall` from that location.
 Modified/unowned entries are preserved, with an error instead of replacement.
+Upgrades explicitly retain the same AppId, use `UsePreviousAppDir=yes` and
+`UninstallLogMode=append`, and never launch the old uninstaller. This updates the
+existing per-user Add/Remove Programs entry instead of adding another product.
+Legacy owned Explorer commands are recognized and migrated for visible errors.
+
+Each new installer records the names and SHA-256 hashes of its installed binaries
+in `FlacCDFiles.txt`, with the manifest hash in its own uninstall registry entry.
+After new files are installed, an upgrade removes an obsolete top-level EXE/DLL
+only if the old manifest is unchanged, the new payload no longer contains that
+name, and the file still matches the old hash. Modified, unreadable or locked
+files are retained with a log message. User files/directories/cache are never
+swept. Installations predating manifests retain untracked obsolete files on their
+first upgrade; ownership is not guessed. Later upgrades can clean tracked files.
 
 Before replacing binaries, setup calls the installed `agent stop --timeout 30`.
 The existing IPC waits for graceful exit, releasing the EXE lock. Failure aborts
@@ -156,6 +173,16 @@ These tests require real Windows and have not been executed by the Linux agent.
 9. With no mounts, uninstall normally; verify menu/Start Menu/uninstall entries
    disappear, default FLAC application and ImgDrive remain, and an unrelated
    sentinel in the retained cache is unchanged.
+10. Inspect all five EXEs' Properties > Details and the setup EXE. Company/publisher
+    must be **Evenstar Systems**, ProductName **FlacCD**, and versions must match
+    the configured release. Check each FileDescription and ARP Publisher too.
+    Run `ctest --test-dir build-windows -R windows-version-metadata -V`.
+11. Install two test releases with the same AppId: include a harmless extra DLL
+    in the first test payload and omit it in the second. An unchanged tracked
+    DLL must disappear; repeat with a modified DLL and modified manifest and
+    verify retention. An unrelated sentinel DLL absent from the old manifest
+    must remain. Verify one ARP entry, correct new versions and Explorer command,
+    intact active mounts, cache/state, and recovery after agent restart.
 
 The packaging implementation follows Inno's
 [per-user privilege mode](https://jrsoftware.org/ishelp/topic_setup_privilegesrequired.htm),

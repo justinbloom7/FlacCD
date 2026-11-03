@@ -1,6 +1,7 @@
 #include "flaccd/mount/ImgDriveBackend.h"
 #include "flaccd/mount/MountAgent.h"
 #include "flaccd/mount/AgentCommand.h"
+#include "flaccd/mount/MountCueDiscovery.h"
 #include "flaccd/CueSheetWriter.h"
 #include "flaccd/PathText.h"
 
@@ -293,6 +294,64 @@ void testAdjacent(const std::filesystem::path& fixtures) {
    backend = s.backend();
    backend->unmount('D');
    require(!std::filesystem::exists(record.cuePath) && backend->status().empty(), "adjacent cleanup failed");
+   s.unchanged();
+}
+
+void testCueDiscovery(const std::filesystem::path& fixtures) {
+   Scenario s(fixtures);
+   const auto expected = flaccd::selectTrackLayout(s.metadata, "auto");
+   writeFile(s.files.adjacent, "malformed external CUE");
+   require(flaccd::compareTrackLayouts(expected, flaccd::discoverMountLayout(s.metadata, s.source, "auto")).empty(),
+           "External sheet displaced valid embedded metadata");
+   auto empty = s.metadata;
+   empty.cueSheets.clear();
+   empty.embeddedCueSheets.clear();
+   expectError([&] { flaccd::discoverMountLayout(empty, s.source, "auto"); });
+   writeFile(s.files.adjacent, s.cue());
+   require(flaccd::compareTrackLayouts(expected, flaccd::discoverMountLayout(empty, s.source, "auto")).empty(),
+           "External fallback layout differs");
+   require(flaccd::compareTrackLayouts(expected, flaccd::discoverMountLayout(empty, s.source, "text")).empty(),
+           "Explicit text selection did not allow external fallback");
+   expectError([&] { flaccd::discoverMountLayout(empty, s.source, "native"); }, "native selection");
+   auto invalid = empty;
+   invalid.embeddedCueSheets = {"malformed embedded CUE"};
+   expectError([&] { flaccd::discoverMountLayout(invalid, s.source, "auto"); }, "no valid CUESHEET");
+   auto conflicting = s.metadata;
+   auto changed = s.cue();
+   const auto index = changed.find("00:00:28");
+   require(index != std::string::npos, "Conflict test index missing");
+   changed.replace(index, 8, "00:00:29");
+   writeFile(s.files.adjacent, changed);
+   require(flaccd::compareTrackLayouts(expected, flaccd::discoverMountLayout(s.metadata, s.source, "auto")).empty(),
+           "Conflicting external layout displaced embedded layout");
+   conflicting.embeddedCueSheets.push_back(changed);
+   expectError([&] { flaccd::discoverMountLayout(conflicting, s.source, "auto"); }, "conflict");
+   writeFile(s.directory.path / "unrelated.flac", "unrelated");
+   auto unrelated = s.cue();
+   const auto begin = unrelated.find("FILE \"") + 6;
+   unrelated.replace(begin, unrelated.find('"', begin) - begin, "unrelated.flac");
+   writeFile(s.files.adjacent, unrelated);
+   expectError([&] { flaccd::discoverMountLayout(empty, s.source, "auto"); }, "does not refer to the selected FLAC");
+   writeFile(s.files.adjacent, s.cue() + "FILE other.flac WAVE\nTRACK 04 AUDIO\nINDEX 01 00:02:00\n");
+   expectError([&] { flaccd::discoverMountLayout(empty, s.source, "auto"); });
+   std::filesystem::remove(s.files.adjacent);
+   expectError([&] { flaccd::discoverMountLayout(empty, s.source, "auto"); },
+               "No embedded CUE sheet and " + flaccd::pathToUtf8(s.files.adjacent) +
+               " does not exist. A cue sheet is required.");
+   expectError([&] { flaccd::discoverMountLayout(empty, s.source, "auto"); }, flaccd::pathToUtf8(s.source));
+   // Exercise the real metadata inspector and full mock mount/eject lifecycle.
+   std::filesystem::copy_file(fixtures / "fixture-no-cue.flac", s.source,
+                              std::filesystem::copy_options::overwrite_existing);
+   s.original = readFile(s.source);
+   s.metadata = flaccd::FlacMetadataInspector{}.inspect(s.source);
+   writeFile(s.files.adjacent, flaccd::generateRelativeFlacCueSheet(expected, s.metadata,
+                                                                 flaccd::pathToUtf8(s.source.filename())));
+   const auto cueContents = readFile(s.files.adjacent);
+   auto backend = s.backend();
+   const auto record = backend->mount(s.source, 'D');
+   require(record.location == flaccd::CueLocation::Existing, "External fallback CUE not reused");
+   backend->unmount('D');
+   require(readFile(s.files.adjacent) == cueContents, "External CUE deleted/modified after eject");
    s.unchanged();
 }
 
@@ -922,6 +981,7 @@ int main(int argumentCount, char* arguments[]) {
          testCue(s.source);
       }
       testAdjacent(fixtures);
+      testCueDiscovery(fixtures);
       testExisting(fixtures);
       testStaging(fixtures);
       testNoCopyAndErrors(fixtures);

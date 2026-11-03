@@ -26,7 +26,7 @@ std::wstring shellMountCommand(std::wstring_view executable) {
          literal += L'%';
       }
    }
-   return quoteWindowsArgument(literal) + L" mount \"%1\"";
+   return quoteWindowsArgument(literal) + L" mount \"%1\" --explorer";
 }
 
 ShellValues shellRegistration(std::wstring_view executable) {
@@ -51,9 +51,15 @@ std::string runShellCommand(ShellRegistry& registry, std::string_view action, st
    }
    const auto path = current->find({L"", L"FlacCD.Executable"});
    bool owned = false;
+   bool legacy = false;
    if (path != current->end()) {
       try {
-         owned = *current == shellRegistration(path->second);
+         auto expected = shellRegistration(path->second);
+         owned = *current == expected;
+         auto& command = expected.at({L"command", L""});
+         command.resize(command.size() - std::wstring_view(L" --explorer").size());
+         legacy = *current == expected;
+         owned = owned || legacy;
       } catch (const std::invalid_argument&) {
          owned = false;
       }
@@ -67,6 +73,11 @@ std::string runShellCommand(ShellRegistry& registry, std::string_view action, st
    }
    if (action == "install" && path->second != executable) {
       throw std::runtime_error("Explorer command belongs to another FlacCD location; run shell uninstall before reinstalling");
+   }
+   if (action == "install" && legacy) {
+      registry.remove(*current);
+      registry.create(shellRegistration(executable));
+      return "Updated FlacCD Explorer command with visible mount errors.\n";
    }
    return "FlacCD Explorer command is installed (shell status does not check ImgDrive).\n";
 }

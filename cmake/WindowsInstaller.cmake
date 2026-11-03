@@ -3,7 +3,8 @@ function(configureWindowsInstaller)
       return()
    endif()
    find_program(FLACCD_ISCC NAMES ISCC.exe ISCC
-      HINTS "$ENV{ProgramFiles}/Inno Setup 6" "$ENV{ProgramFiles\(x86\)}/Inno Setup 6"
+      HINTS "$ENV{ProgramFiles}/Inno Setup 7" "$ENV{LOCALAPPDATA}/Programs/Inno Setup 7"
+            "$ENV{ProgramFiles}/Inno Setup 6" "$ENV{ProgramFiles\(x86\)}/Inno Setup 6"
             "$ENV{LOCALAPPDATA}/Programs/Inno Setup 6"
       DOC "Inno Setup 6.3+ compiler (ISCC.exe)")
    add_custom_target(flaccd-installer

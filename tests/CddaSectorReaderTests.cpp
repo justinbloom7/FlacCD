@@ -95,7 +95,8 @@ void createFlac(const std::filesystem::path& path,
                 std::uint32_t sampleRate = 44100,
                 std::uint32_t channels = 2,
                 std::uint32_t bitsPerSample = 16,
-                std::string_view cueText = CUE_TEXT) {
+                std::string_view cueText = CUE_TEXT,
+                bool includeCue = true) {
    using Encoder = std::unique_ptr<FLAC__StreamEncoder, decltype(&FLAC__stream_encoder_delete)>;
    Metadata comments(FLAC__metadata_object_new(FLAC__METADATA_TYPE_VORBIS_COMMENT), &FLAC__metadata_object_delete);
    require(static_cast<bool>(comments), "Allocate Vorbis comments");
@@ -104,7 +105,9 @@ void createFlac(const std::filesystem::path& path,
    FLAC__StreamMetadata_VorbisComment_Entry entry;
    entry.entry = reinterpret_cast<FLAC__byte*>(cueComment.data());
    entry.length = static_cast<FLAC__uint32>(cueComment.size());
-   require(FLAC__metadata_object_vorbiscomment_append_comment(comments.get(), entry, true), "Set CUESHEET comment");
+   if (includeCue) {
+      require(FLAC__metadata_object_vorbiscomment_append_comment(comments.get(), entry, true), "Set CUESHEET comment");
+   }
    for (std::string comment : {"ALBUM=Fixture Album", "album=Fixture Album",
                                      "ALBUMARTIST=Fixture Album Artist", "ARTIST=Fixture Artist"}) {
       entry.entry = reinterpret_cast<FLAC__byte*>(comment.data());
@@ -121,7 +124,7 @@ void createFlac(const std::filesystem::path& path,
    require(FLAC__stream_encoder_set_sample_rate(encoder.get(), sampleRate), "Set sample rate");
    require(FLAC__stream_encoder_set_blocksize(encoder.get(), blockSize), "Set block size");
    require(FLAC__stream_encoder_set_total_samples_estimate(encoder.get(), SAMPLE_COUNT), "Set sample count");
-   require(FLAC__stream_encoder_set_metadata(encoder.get(), blocks.data(), 2), "Set encoder metadata");
+   require(FLAC__stream_encoder_set_metadata(encoder.get(), blocks.data(), includeCue ? 2 : 1), "Set encoder metadata");
    const auto initStatus = FLAC__stream_encoder_init_file(encoder.get(), path.string().c_str(), nullptr, nullptr);
    require(initStatus == FLAC__STREAM_ENCODER_INIT_STATUS_OK, "Initialize test FLAC encoder");
    std::vector<FLAC__int32> samples(1024 * channels);
@@ -269,6 +272,7 @@ int main(int argumentCount, char* arguments[]) {
       require(argumentCount == 2, "Expected fixture directory");
       const std::filesystem::path directory(arguments[1]);
       std::filesystem::create_directories(directory);
+      createFlac(directory / "fixture-no-cue.flac", 4096, 44100, 2, 16, CUE_TEXT, false);
       for (const auto blockSize : {192U, 4096U, 16384U, 65535U}) {
          const auto path = directory / ("fixture-" + std::to_string(blockSize) + ".flac");
          createFlac(path, blockSize);

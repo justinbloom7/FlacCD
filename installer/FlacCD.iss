@@ -8,19 +8,34 @@
 #ifndef OUTPUT_DIR
    #error OUTPUT_DIR must be supplied by CMake
 #endif
+#ifndef APP_PUBLISHER
+   #error APP_PUBLISHER must be supplied by CMake
+#endif
+#ifndef PRODUCT_NAME
+   #error PRODUCT_NAME must be supplied by CMake
+#endif
+#ifndef MANIFEST_FILE
+   #error MANIFEST_FILE must be supplied by CMake
+#endif
 #if VER < EncodeVer(6, 3, 0)
    #error Inno Setup 6.3 or newer is required
 #endif
 
 [Setup]
 AppId={{70A8B7A2-BE27-4D88-9566-76E87C57F284}
-AppName=FlacCD
+AppName={#PRODUCT_NAME}
+AppPublisher={#APP_PUBLISHER}
 AppVersion={#APP_VERSION}
 AppVerName=FlacCD {#APP_VERSION}
 VersionInfoVersion={#APP_VERSION}
+VersionInfoCompany={#APP_PUBLISHER}
+VersionInfoProductName={#PRODUCT_NAME}
+VersionInfoDescription={#PRODUCT_NAME} Setup
 DefaultDirName={localappdata}\Programs\FlacCD
 DefaultGroupName=FlacCD
 DisableDirPage=yes
+UsePreviousAppDir=yes
+UninstallLogMode=append
 DisableProgramGroupPage=yes
 PrivilegesRequired=lowest
 ArchitecturesAllowed=x64os
@@ -39,6 +54,7 @@ SetupMutex=FlacCD.Setup.v1
 
 [Files]
 Source: "{#PAYLOAD_DIR}\*"; DestDir: "{app}"; Excludes: ".FlacCD-deployment,imports\*,source-imports\*"; Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "{#MANIFEST_FILE}"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
 Name: "{group}\FlacCD installation and usage"; Filename: "{sys}\notepad.exe"; Parameters: """{app}\docs\WindowsInstaller.md"""
@@ -51,6 +67,63 @@ const
 
 var
    registrationFailed: Boolean;
+   oldFiles: TArrayOfString;
+
+procedure removeObsoleteBinaries();
+var
+   newFiles: TArrayOfString;
+   index, next, separator: Integer;
+   name, digest, candidate: String;
+   retained: Boolean;
+begin
+   if GetArrayLength(oldFiles) = 0 then begin
+      Exit;
+   end;
+   if oldFiles[0] <> 'FlacCD installed binaries v1' then begin
+      Log('Unknown old binary manifest; obsolete files retained.');
+      Exit;
+   end;
+   if not LoadStringsFromFile(ExpandConstant('{app}\FlacCDFiles.txt'), newFiles) then begin
+      Log('Cannot read new binary manifest; obsolete files retained.');
+      Exit;
+   end;
+   for index := 1 to GetArrayLength(oldFiles) - 1 do begin
+      separator := Pos('|', oldFiles[index]);
+      if separator > 1 then begin
+         name := Copy(oldFiles[index], 1, separator - 1);
+         digest := Copy(oldFiles[index], separator + 1, 64);
+         { Only top-level binaries may be obsolete. Never delete a directory,
+           user cache, arbitrary path, or a modified installed file. }
+         if (ExtractFileName(name) = name) and (Pos(':', name) = 0) and
+            (Pos('/', name) = 0) and (Pos('\', name) = 0) and
+            ((CompareText(ExtractFileExt(name), '.dll') = 0) or
+             (CompareText(ExtractFileExt(name), '.exe') = 0)) then begin
+            retained := False;
+            for next := 1 to GetArrayLength(newFiles) - 1 do begin
+               if CompareText(Copy(newFiles[next], 1, Pos('|', newFiles[next]) - 1), name) = 0 then begin
+                  retained := True;
+               end;
+            end;
+            candidate := ExpandConstant('{app}\') + name;
+            if not retained and FileExists(candidate) then begin
+               try
+                  if CompareText(GetSHA256OfFile(candidate), digest) = 0 then begin
+                     if not DeleteFile(candidate) then begin
+                        Log('Obsolete binary is locked; retained: ' + candidate);
+                     end else begin
+                        Log('Removed unchanged obsolete binary: ' + candidate);
+                     end;
+                  end else begin
+                     Log('Modified obsolete binary retained: ' + candidate);
+                  end;
+               except
+                  Log('Cannot inspect obsolete binary; retained: ' + candidate);
+               end;
+            end;
+         end;
+      end;
+   end;
+end;
 
 function expandEnvironment(source: String; destination: String; size: LongWord): LongWord;
    external 'ExpandEnvironmentStringsW@kernel32.dll stdcall';
@@ -130,10 +203,26 @@ end;
 
 function PrepareToInstall(var needsRestart: Boolean): String;
 var
-   executable, registered: String;
+   executable, registered, manifestHash: String;
 begin
    Result := '';
    executable := ExpandConstant('{app}\flaccd.exe');
+   { Snapshot the previous manifest before [Files] replaces it. Pre-manifest
+     installations retain untracked files rather than guessing ownership. }
+   SetArrayLength(oldFiles, 0);
+   if FileExists(ExpandConstant('{app}\FlacCDFiles.txt')) then begin
+      if RegQueryStringValue(HKCU64, UNINSTALL_KEY, 'FlacCDBinaryManifestSHA256', manifestHash) then begin
+         try
+            if CompareText(GetSHA256OfFile(ExpandConstant('{app}\FlacCDFiles.txt')), manifestHash) = 0 then begin
+               LoadStringsFromFile(ExpandConstant('{app}\FlacCDFiles.txt'), oldFiles);
+            end else begin
+               Log('Modified binary manifest; obsolete files retained.');
+            end;
+         except
+            Log('Cannot inspect old binary manifest; obsolete files retained.');
+         end;
+      end;
+   end;
    if RegQueryStringValue(HKCU64, SHELL_KEY, 'FlacCD.Executable', registered) then begin
       if CompareText(registered, executable) <> 0 then begin
          Result := 'Explorer integration belongs to another FlacCD location: ' + registered +
@@ -158,6 +247,11 @@ var
    problem: String;
 begin
    if curStep = ssPostInstall then begin
+      removeObsoleteBinaries();
+      if not RegWriteStringValue(HKCU64, UNINSTALL_KEY, 'FlacCDBinaryManifestSHA256',
+                                 GetSHA256OfFile(ExpandConstant('{app}\FlacCDFiles.txt'))) then begin
+         Log('Cannot record manifest ownership; future upgrades will retain untracked binaries.');
+      end;
       problem := runFlacCD(ExpandConstant('{app}\flaccd.exe'), 'shell install');
       if problem <> '' then begin
          registrationFailed := True;

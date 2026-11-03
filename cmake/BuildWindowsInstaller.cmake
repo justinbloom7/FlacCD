@@ -13,13 +13,19 @@ endif()
 set(deployMode verify)
 include("${CMAKE_CURRENT_LIST_DIR}/DeployWindows.cmake")
 include("${CMAKE_CURRENT_LIST_DIR}/InstallerPayload.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/ProductMetadata.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/InstalledBinaries.cmake")
 validateInstallerPayload("${deployDirectory}" "${deployExecutables}")
 file(MAKE_DIRECTORY "${installerOutput}")
 string(RANDOM LENGTH 16 ALPHABET 0123456789abcdef stagingId)
 set(stagingOutput "${installerOutput}/.compile-${stagingId}")
 file(MAKE_DIRECTORY "${stagingOutput}")
 set(installerName "FlacCD-${appVersion}-windows-x64-setup.exe")
+set(manifestFile "${stagingOutput}/FlacCDFiles.txt")
+writeInstalledBinaries("${deployDirectory}" "${manifestFile}")
 execute_process(COMMAND "${iscc}" "/DAPP_VERSION=${appVersion}"
+                        "/DAPP_PUBLISHER=${FLACCD_PUBLISHER}" "/DPRODUCT_NAME=${FLACCD_PRODUCT_NAME}"
+                        "/DMANIFEST_FILE=${manifestFile}"
                         "/DPAYLOAD_DIR=${deployDirectory}" "/DOUTPUT_DIR=${stagingOutput}"
                         "${sourceRoot}/installer/FlacCD.iss"
                 RESULT_VARIABLE result)

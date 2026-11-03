@@ -29,7 +29,7 @@ folders and filenames containing spaces, Unicode, shell metacharacters, literal
 2. Run `flaccd.exe shell install` twice, then `shell status`. Inspect only
    `HKCU\Software\Classes\SystemFileAssociations\.flac\shell\FlacCD.MountAudioCD`.
    The label is **Mount as Audio CD**; `MultiSelectModel` is `Single`. The command
-   is `"<absolute flaccd.exe path>" mount "%1"`. Literal percent signs in the
+   is `"<absolute flaccd.exe path>" mount "%1" --explorer`. Literal percent signs in the
    executable path are doubled for the ShellExecute command template. Values
    use Unicode `REG_SZ`, not environment-expanding `REG_EXPAND_SZ`.
 3. Right-click a known-good FLAC album, such as your actual Zelda.flac path.
@@ -55,6 +55,21 @@ folders and filenames containing spaces, Unicode, shell metacharacters, literal
    An existing registration pointing elsewhere is preserved: uninstall it before
    reinstalling. If registration is interrupted or cannot be read, inspect the
    reported registry error rather than deleting the association parent key.
+10. Mount a FLAC with no embedded CUE and no adjacent matching CUE. Explorer
+    must display a persistent error dialog: **No embedded CUE sheet and [the
+    expected full CUE path] does not exist. A cue sheet is required.** It also
+    names the FLAC. Dismiss it normally; no backing files should be created.
+    The same CLI mount without `--explorer` must report the error on stderr
+    without a dialog. Test an unrelated external FILE reference and a malformed
+    external CUE too.
+11. Mount a valid external single-file audio CUE beside a FLAC without embedded
+    CUE metadata. Confirm expected tracks and eject cleanup, with the external
+    user CUE unchanged. Test spaces and Unicode. Add a conflicting external CUE
+    beside a FLAC with valid embedded metadata: embedded layout retains
+    precedence and the existing isolated staging fallback remains available.
+12. Upgrade an installation whose Explorer registration lacks `--explorer`.
+    `shell status` must recognize the legacy owned entry; `shell install` should
+    migrate it. Foreign/modified entries must still be preserved.
 
 Installation uses Unicode registry APIs, a per-user registration mutex, exclusive
 creation of the dedicated verb, strict ownership/value checks, and nonrecursive

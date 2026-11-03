@@ -21,8 +21,18 @@ on the destination computer.
    administrator approval.
 2. Run `FlacCD-<version>-windows-x64-setup.exe` as your normal Windows user.
    FlacCD defaults to `%LOCALAPPDATA%\Programs\FlacCD` without requiring elevation.
-3. Right-click a FLAC album containing an embedded CUE sheet and choose
+3. Right-click a FLAC album containing an embedded CUE sheet, or with a matching
+   external `.cue` beside it, and choose
    **Mount as Audio CD** (under **Show more options** on Windows 11).
+
+Mounting prefers embedded native/text CUE metadata and preserves existing layout
+conflict diagnostics. Only when neither embedded form is present does it use
+`Album.cue` beside `Album.flac`. That external sheet must reference the selected
+FLAC and describe one supported audio-only source file. An invalid embedded
+sheet is not silently replaced by an external one. If neither source exists,
+FlacCD reports **No embedded CUE sheet and [full path to Album.cue] does not
+exist. A cue sheet is required.** Explorer launches show a persistent error
+dialog; normal CLI use continues to report errors in the terminal.
 
 The FlacCD installer registers the Explorer command and installs its runtime
 dependencies from the audited deployment. **It does not download, install, or
@@ -94,6 +104,9 @@ outputs include:
 - Optional ZIP: run `cmake --build build-windows --target flaccd-package`.
 
 Version numbers come from `project(FlacCD VERSION ...)` in `CMakeLists.txt`.
+The publisher is **Evenstar Systems**; publisher/product definitions are shared
+by Windows executable VERSIONINFO and installer metadata in
+`cmake/ProductMetadata.cmake`.
 Distribute the installer or complete staged folder/ZIP, rather than individual
 EXEs from the build directory. The staged package supplies required DLLs; no
 MSYS2 directories need to be added to the destination computer's PATH.

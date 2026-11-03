@@ -1,5 +1,9 @@
 cmake_minimum_required(VERSION 3.20)
 project(FlacCD VERSION 0.1.0 LANGUAGES CXX)
+include(cmake/ProductMetadata.cmake)
+if(WIN32)
+   enable_language(RC)
+endif()
 
 if(CMAKE_SOURCE_DIR STREQUAL CMAKE_BINARY_DIR)
    message(FATAL_ERROR "Use an out-of-source build: cmake -S . -B build -G Ninja")
@@ -48,6 +52,7 @@ if(WIN32 OR BUILD_TESTING)
                             src/mount/MountStateStore.cpp
                             src/mount/MountFileSystem.cpp
                             src/mount/ProcessRunner.cpp)
+   target_sources(flaccd-mount PRIVATE src/mount/MountCueDiscovery.cpp)
    target_sources(flaccd-mount PRIVATE src/shell/ShellRegistration.cpp)
    target_link_libraries(flaccd-mount PUBLIC flaccd-core)
    set_target_properties(flaccd-mount PROPERTIES CXX_EXTENSIONS OFF)
@@ -81,8 +86,8 @@ if(WIN32)
       target_compile_options(flaccd-core PRIVATE /utf-8)
       target_compile_options(flaccd-mount PRIVATE /utf-8)
       target_compile_options(flaccd-imgdrive PRIVATE /utf-8)
-      target_compile_options(flaccd PRIVATE /utf-8)
-      target_compile_options(flaccd-agent PRIVATE /utf-8)
+      target_compile_options(flaccd PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/utf-8>")
+      target_compile_options(flaccd-agent PRIVATE "$<$<COMPILE_LANGUAGE:CXX>:/utf-8>")
    endif()
 endif()
 
@@ -132,6 +137,12 @@ if(BUILD_TESTING)
    set_target_properties(flaccd-process-diagnostic-tests PROPERTIES CXX_EXTENSIONS OFF)
    add_test(NAME process-argument-diagnostics COMMAND flaccd-process-diagnostic-tests)
    if(WIN32)
+      add_test(NAME windows-version-metadata
+         COMMAND "$ENV{SystemRoot}/System32/WindowsPowerShell/v1.0/powershell.exe"
+            -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass
+            -File "${PROJECT_SOURCE_DIR}/tests/WindowsVersionTests.ps1"
+            -Directory "$<TARGET_FILE_DIR:flaccd>" -Publisher "${FLACCD_PUBLISHER}"
+            -Product "${FLACCD_PRODUCT_NAME}" -Version "${PROJECT_VERSION}.0")
       add_executable(flaccd-windows-shell-tests tests/WindowsShellTests.cpp)
       target_link_libraries(flaccd-windows-shell-tests PRIVATE flaccd-imgdrive ole32 shell32 advapi32)
       add_executable(flaccd-shell-probe tests/WindowsShellProbe.cpp)
@@ -272,6 +283,8 @@ if(BUILD_TESTING)
 endif()
 
 include(cmake/WindowsDeployment.cmake)
+include(cmake/WindowsMetadata.cmake)
+configureWindowsMetadata()
 configureWindowsDeployment()
 include(cmake/WindowsInstaller.cmake)
 configureWindowsInstaller()

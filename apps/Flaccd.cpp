@@ -24,6 +24,7 @@ void printUsage() {
              << "Other commands start a per-user agent as needed; agent stop never starts one.\n"
              << "Auto selects an identified, visible, empty ImgDrive device. Physical drives are refused.\n"
              << "Mounting reuses/creates an adjacent CUE, else stages a hard link or compressed copy.\n"
+             << "With no embedded CUE, mounting requires a matching adjacent .cue referencing the FLAC.\n"
              << "--no-copy forbids compressed copies. No BIN is generated.\n"
              << "External eject cleanup normally takes 5..10 seconds after empty media is confirmed.\n"
              << "Unknown/missing devices and uncertain mounts retain resources for inspection.\n"
@@ -34,7 +35,12 @@ void printUsage() {
              << "Windows 11 may show the command under Show more options.\n";
 }
 
-int run(std::vector<std::string> arguments) {
+void showExplorerError(const std::string& message) {
+   MessageBoxW(nullptr, flaccd::pathFromUtf8(message).c_str(), L"FlacCD - Mount as Audio CD",
+               MB_OK | MB_ICONERROR | MB_SETFOREGROUND);
+}
+
+int run(std::vector<std::string> arguments, bool explorer) {
    if (arguments.empty() || (arguments.size() == 1 && arguments[0] == "--help")) {
       printUsage();
       return arguments.empty() ? 2 : 0;
@@ -50,6 +56,9 @@ int run(std::vector<std::string> arguments) {
    const auto reply = flaccd::runWindowsAgentClient(std::move(arguments));
    std::cout << reply.output;
    std::cerr << reply.diagnostics;
+   if (explorer && reply.exitCode != 0) {
+      showExplorerError(reply.diagnostics.empty() ? reply.output : reply.diagnostics);
+   }
    return static_cast<int>(reply.exitCode);
 }
 
@@ -57,17 +66,29 @@ int run(std::vector<std::string> arguments) {
 
 int wmain(int argumentCount, wchar_t* arguments[]) {
    SetConsoleOutputCP(CP_UTF8);
+   bool explorer = false;
    try {
       std::vector<std::string> text;
       for (int position = 1; position < argumentCount; ++position) {
+         if (position >= 3 && std::wstring_view(arguments[position]) == L"--explorer" &&
+             std::wstring_view(arguments[1]) == L"mount") {
+            explorer = true;
+            continue;
+         }
          text.push_back(flaccd::pathToUtf8(std::filesystem::path(arguments[position])));
       }
-      return run(std::move(text));
+      return run(std::move(text), explorer);
    } catch (const std::invalid_argument& error) {
       std::cerr << "flaccd: " << error.what() << '\n';
+      if (explorer) {
+         showExplorerError(error.what());
+      }
       return 2;
    } catch (const std::exception& error) {
       std::cerr << "flaccd: " << error.what() << '\n';
+      if (explorer) {
+         showExplorerError(error.what());
+      }
       return 1;
    }
 }

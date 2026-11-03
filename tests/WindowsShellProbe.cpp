@@ -7,7 +7,7 @@
 // Deliberately independent of FlacCD and its agent; record the UTF-16 filename
 // received through ShellExecute, without mounting or invoking a command shell.
 int wmain(int count, wchar_t* arguments[]) {
-   if (count != 3 || std::wstring(arguments[1]) != L"mount") {
+   if (count != 4 || std::wstring(arguments[1]) != L"mount" || std::wstring(arguments[3]) != L"--explorer") {
       return 2;
    }
    wchar_t executable[32768];

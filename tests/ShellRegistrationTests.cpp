@@ -47,14 +47,14 @@ public:
 int main() {
    try {
       const std::wstring executable = L"C:\\Audio tools & (test)\\\u97f3\u697d\\flaccd.exe";
-      require(flaccd::shellMountCommand(executable) == L"\"" + executable + L"\" mount \"%1\"",
+      require(flaccd::shellMountCommand(executable) == L"\"" + executable + L"\" mount \"%1\" --explorer",
               "Executable or filename placeholder not quoted exactly");
       require(flaccd::shellMountCommand(L"C:\\%1 %L %PATH% !^;'\\flaccd.exe") ==
-                 L"\"C:\\%%1 %%L %%PATH%% !^;'\\flaccd.exe\" mount \"%1\"",
+                 L"\"C:\\%%1 %%L %%PATH%% !^;'\\flaccd.exe\" mount \"%1\" --explorer",
               "Executable template percent escaping");
       require(flaccd::shellMountCommand(L"\\\\server\\share name\\flaccd.exe").starts_with(L"\"\\\\server"),
               "UNC executable path");
-      require(flaccd::shellMountCommand(L"C:\\FlacCD.ExE") == L"\"C:\\FlacCD.ExE\" mount \"%1\"",
+      require(flaccd::shellMountCommand(L"C:\\FlacCD.ExE") == L"\"C:\\FlacCD.ExE\" mount \"%1\" --explorer",
               "Executable case not preserved");
       for (const auto path : {L"flaccd.exe", L"C:flaccd.exe", L"C:\\bad\"\\flaccd.exe", L"C:\\bad\n.exe"}) {
          fails([&] { flaccd::shellMountCommand(path); });
@@ -69,6 +69,11 @@ int main() {
       flaccd::runShellCommand(registry, "install", executable);
       flaccd::runShellCommand(registry, "status", executable);
       require(registry.writes == 1 && registry.values == installed, "Install/status not idempotent");
+      auto& legacyCommand = registry.values->at({L"command", L""});
+      legacyCommand.resize(legacyCommand.size() - std::wstring_view(L" --explorer").size());
+      flaccd::runShellCommand(registry, "status", executable);
+      flaccd::runShellCommand(registry, "install", executable);
+      require(registry.values == installed, "Legacy Explorer registration did not migrate");
       fails([&] { flaccd::runShellCommand(registry, "install", L"D:\\flaccd.exe"); });
       require(registry.values == installed, "Another installation overwritten");
       (*registry.values)[{L"command", L""}] = L"user edited command";

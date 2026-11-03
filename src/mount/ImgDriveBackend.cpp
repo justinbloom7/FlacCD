@@ -1,4 +1,5 @@
 #include "flaccd/mount/ImgDriveBackend.h"
+#include "flaccd/mount/MountCueDiscovery.h"
 #include "flaccd/CueSheetWriter.h"
 #include "flaccd/PathText.h"
 
@@ -82,7 +83,7 @@ bool compatibleCue(const std::filesystem::path& cuePath,
          reason = "FILE reference/type or matching basename does not identify the intended FLAC";
          return false;
       }
-      const auto differences = compareTrackLayouts(layout, TrackLayout::fromText(metadata, parsed));
+      const auto differences = compareTrackLayouts(layout, externalMountLayout(metadata, parsed, cuePath, source));
       if (!differences.empty()) {
          reason = differences.front();
          return false;
@@ -137,6 +138,9 @@ MountRecord ImgDriveBackend::mount(const std::filesystem::path& source,
                                    std::string_view layoutSource,
                                    const MountPrepared& prepared,
                                    bool noCopy) {
+   const auto original = std::filesystem::canonical(source);
+   const auto metadata = FlacMetadataInspector{}.inspect(original);
+   const auto layout = discoverMountLayout(metadata, original, layoutSource);
    char drive = 0;
    if (requestedDrive) {
       drive = normalizeDrive(*requestedDrive);
@@ -175,9 +179,6 @@ MountRecord ImgDriveBackend::mount(const std::filesystem::path& source,
       throw std::runtime_error("selected optical drive is occupied, missing, or cannot be verified empty; "
                                "configure an empty visible ImgDrive drive first");
    }
-   const auto original = std::filesystem::canonical(source);
-   const auto metadata = FlacMetadataInspector{}.inspect(original);
-   const auto layout = selectTrackLayout(metadata, layoutSource);
    auto record = prepare(drive, original, metadata, layout, noCopy);
    record = store.bindDevice(record, drive, target->identity, target->selector());
    store.validate(record);
