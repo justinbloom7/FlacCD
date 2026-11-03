@@ -27,10 +27,9 @@ folders and filenames containing spaces, Unicode, shell metacharacters, literal
 ### Isolated ShellExecute scope and diagnostics
 
 The earlier fixture passed a generic key outside `Software\Classes` through
-`SEE_MASK_CLASSKEY`. That fixture failed on the developer's Windows system with
-the reported value `2147746293` (`0x800401F5`, `CO_E_APPNOTFOUND`, Application not
-found). It assumed the arbitrary registry tree behaved like a registered file
-class. The replacement uses a genuine, unassociated test ProgID visible through
+`SEE_MASK_CLASSKEY`. Its combined failure assertion did not establish whether
+class lookup failed or a process handle was missing. The replacement uses a
+genuine, unassociated test ProgID visible through
 HKCR and explicitly verifies that the merged class command equals the command
 written by the production registration implementation before launching it.
 [Microsoft documents](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/ns-shellapi-shellexecuteinfow)
@@ -54,6 +53,18 @@ FALSE or TRUE without a handle, so the precise original internal failure path
 cannot be reconstructed from that message alone. The new diagnostics preserve
 that distinction if a native launch still fails.
 
+Subsequent Windows results established a different, production command-building
+defect: the normal-path case passed, but the executable folder containing literal
+percent signs failed with `2147746293` (`0x800401F5`, `CO_E_APPNOTFOUND`, Application
+not found). The command had doubled executable-path percent signs, so it named a
+different executable. The executable token is now quoted with its percent signs
+unchanged; only the argument-list `"%1"` is the selected-file placeholder. This
+is a direct REG_SZ command, not a batch file. The native percent-containing
+round-trip case remains unchanged. Old doubled-percent registrations are
+recognized by their complete expected values and repaired by `shell install`;
+edited/foreign registrations remain protected. The corrected native test still
+requires execution on Windows before claiming the fix verified there.
+
 Run on Windows:
 
 ```bash
@@ -71,7 +82,7 @@ ctest --test-dir build-windows --output-on-failure
    `HKCU\Software\Classes\SystemFileAssociations\.flac\shell\FlacCD.MountAudioCD`.
    The label is **Mount as Audio CD**; `MultiSelectModel` is `Single`. The command
    is `"<absolute flaccd.exe path>" mount "%1" --explorer`. Literal percent signs in the
-   executable path are doubled for the ShellExecute command template. Values
+   executable path remain unchanged. Values
    use Unicode `REG_SZ`, not environment-expanding `REG_EXPAND_SZ`.
 3. Right-click a known-good FLAC album, such as your actual Zelda.flac path.
    Use **Show more options** on Windows 11. Confirm the audio CD and expected

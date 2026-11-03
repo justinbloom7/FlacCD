@@ -49,9 +49,9 @@ int main() {
       const std::wstring executable = L"C:\\Audio tools & (test)\\\u97f3\u697d\\flaccd.exe";
       require(flaccd::shellMountCommand(executable) == L"\"" + executable + L"\" mount \"%1\" --explorer",
               "Executable or filename placeholder not quoted exactly");
-      require(flaccd::shellMountCommand(L"C:\\%1 %L %PATH% !^;'\\flaccd.exe") ==
-                 L"\"C:\\%%1 %%L %%PATH%% !^;'\\flaccd.exe\" mount \"%1\" --explorer",
-              "Executable template percent escaping");
+      require(flaccd::shellMountCommand(L"C:\\%1 %L %PATH% %% !^;'\\flaccd.exe") ==
+                 L"\"C:\\%1 %L %PATH% %% !^;'\\flaccd.exe\" mount \"%1\" --explorer",
+              "Literal percent signs in executable filename changed");
       require(flaccd::shellMountCommand(L"\\\\server\\share name\\flaccd.exe").starts_with(L"\"\\\\server"),
               "UNC executable path");
       require(flaccd::shellMountCommand(L"C:\\FlacCD.ExE") == L"\"C:\\FlacCD.ExE\" mount \"%1\" --explorer",
@@ -96,6 +96,18 @@ int main() {
       fails([&] { flaccd::runShellCommand(registry, "install", executable); });
       require(!registry.values, "Failed install created registration");
       fails([&] { flaccd::runShellCommand(registry, "bad-action", executable); });
+      const std::wstring percentExecutable = L"C:\\%1 %L %PATH% %%\\flaccd.exe";
+      for (const auto suffix : {L"", L" --explorer"}) {
+         Registry previous;
+         previous.values = flaccd::shellRegistration(percentExecutable);
+         previous.values->at({L"command", L""}) =
+            std::wstring(L"\"C:\\%%1 %%L %%PATH%% %%%%\\flaccd.exe\" mount \"%1\"") + suffix;
+         flaccd::runShellCommand(previous, "status", percentExecutable);
+         flaccd::runShellCommand(previous, "install", percentExecutable);
+         require(previous.values == flaccd::shellRegistration(percentExecutable), "Doubled-percent registration not repaired");
+         flaccd::runShellCommand(previous, "uninstall", percentExecutable);
+         require(!previous.values, "Repaired registration not removable");
+      }
       std::cout << "Shell registration policy and command construction passed\n";
       return 0;
    } catch (const std::exception& error) {
