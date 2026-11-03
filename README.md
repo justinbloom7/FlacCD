@@ -476,6 +476,14 @@ investigation notes remain under `docs/historical/`.
 
 ### Windows Explorer integration
 
+A per-user Windows x64 installer can now be built with
+`cmake --build build-windows --target flaccd-installer` after configuring
+`FLACCD_ISCC` to an Inno Setup 6.3+ compiler. It packages the smoke-tested staged
+deployment, registers Explorer through the existing CLI, and stops the agent
+gracefully for upgrades/uninstall while retaining mount resources and user state.
+See [WindowsInstaller.md](docs/WindowsInstaller.md) for build commands, ImgDrive
+prerequisites, maintenance behavior and Windows VM acceptance tests.
+
 From the final deployed FlacCD folder, register the per-user FLAC context menu:
 
 ```text

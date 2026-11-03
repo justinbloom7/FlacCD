@@ -106,6 +106,8 @@ endforeach()
 if(sourceRoot AND EXISTS "${sourceRoot}/docs/WindowsDeployment.md")
    file(COPY "${sourceRoot}/docs/WindowsDeployment.md" DESTINATION "${stageDirectory}/docs")
    file(COPY "${sourceRoot}/docs/WindowsAgentTesting.md" DESTINATION "${stageDirectory}/docs")
+   file(COPY "${sourceRoot}/docs/WindowsInstaller.md" DESTINATION "${stageDirectory}/docs")
+   file(COPY "${sourceRoot}/docs/WindowsShellTesting.md" DESTINATION "${stageDirectory}/docs")
 endif()
 auditDeployment("${stageDirectory}")
 # Publish only after both the source closure and isolated adjacent-DLL closure

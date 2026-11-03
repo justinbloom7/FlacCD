@@ -87,6 +87,10 @@ if(WIN32)
 endif()
 
 if(BUILD_TESTING)
+   add_test(NAME installer-payload COMMAND "${CMAKE_COMMAND}"
+      "-DsourceRoot=${PROJECT_SOURCE_DIR}"
+      "-DtestDirectory=${CMAKE_CURRENT_BINARY_DIR}/installer-fixtures"
+      -P "${PROJECT_SOURCE_DIR}/tests/InstallerPayloadTests.cmake")
    add_executable(flaccd-shell-tests tests/ShellRegistrationTests.cpp)
    target_link_libraries(flaccd-shell-tests PRIVATE flaccd-mount)
    set_target_properties(flaccd-shell-tests PROPERTIES CXX_EXTENSIONS OFF)
@@ -269,3 +273,5 @@ endif()
 
 include(cmake/WindowsDeployment.cmake)
 configureWindowsDeployment()
+include(cmake/WindowsInstaller.cmake)
+configureWindowsInstaller()

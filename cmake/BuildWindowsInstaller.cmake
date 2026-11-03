@@ -1,0 +1,32 @@
+cmake_minimum_required(VERSION 3.20)
+if(NOT CMAKE_HOST_WIN32)
+   message(FATAL_ERROR "Build the installer on Windows with Inno Setup 6.3+")
+endif()
+if(NOT EXISTS "${iscc}")
+   message(FATAL_ERROR "Install Inno Setup 6.3+ and configure -DFLACCD_ISCC=C:/path/to/ISCC.exe")
+endif()
+if(NOT appVersion MATCHES "^[0-9]+\\.[0-9]+\\.[0-9]+$")
+   message(FATAL_ERROR "Installer version must be MAJOR.MINOR.PATCH")
+endif()
+# Including the audit holds Deployment.lock in this process through ISCC,
+# preventing another deploy from replacing the folder during compression.
+set(deployMode verify)
+include("${CMAKE_CURRENT_LIST_DIR}/DeployWindows.cmake")
+include("${CMAKE_CURRENT_LIST_DIR}/InstallerPayload.cmake")
+validateInstallerPayload("${deployDirectory}" "${deployExecutables}")
+file(MAKE_DIRECTORY "${installerOutput}")
+string(RANDOM LENGTH 16 ALPHABET 0123456789abcdef stagingId)
+set(stagingOutput "${installerOutput}/.compile-${stagingId}")
+file(MAKE_DIRECTORY "${stagingOutput}")
+set(installerName "FlacCD-${appVersion}-windows-x64-setup.exe")
+execute_process(COMMAND "${iscc}" "/DAPP_VERSION=${appVersion}"
+                        "/DPAYLOAD_DIR=${deployDirectory}" "/DOUTPUT_DIR=${stagingOutput}"
+                        "${sourceRoot}/installer/FlacCD.iss"
+                RESULT_VARIABLE result)
+if(NOT result EQUAL 0 OR NOT EXISTS "${stagingOutput}/${installerName}")
+   file(REMOVE_RECURSE "${stagingOutput}")
+   message(FATAL_ERROR "Inno Setup compilation failed (${result}); no installer is ready for release")
+endif()
+file(RENAME "${stagingOutput}/${installerName}" "${installerOutput}/${installerName}")
+file(REMOVE_RECURSE "${stagingOutput}")
+message(STATUS "Installer: ${installerOutput}/${installerName}")
