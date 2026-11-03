@@ -2,6 +2,7 @@
 #include "flaccd/mount/WindowsImgDriveHost.h"
 #include "flaccd/PathText.h"
 #include "flaccd/shell/WindowsShellRegistry.h"
+#include "flaccd/mount/WindowsRestore.h"
 
 #include <windows.h>
 
@@ -17,11 +18,15 @@ void printUsage() {
              << "  flaccd drives\n"
              << "  flaccd agent stop [--timeout SECONDS]\n"
              << "  flaccd shell install|uninstall|status\n"
+             << "  flaccd restore enable|disable|status\n"
+             << "  flaccd restore run [--timeout SECONDS]  (1..300; default 60)\n"
+             << "  flaccd restore forget FILE.flac\n"
              << "Options (after command):\n"
              << "  --imgdrive PATH.exe    Installed executable (or FLACCD_IMGDRIVE)\n"
              << "  --cache-dir DIR        Persistent cache; default LocalAppData/FlacCD/ImgDrive/v1\n"
              << "  --timeout SECONDS      1..600; default 30; total deadline for agent stop\n"
-             << "Other commands start a per-user agent as needed; agent stop never starts one.\n"
+             << "Mount/unmount/status/drives start a per-user agent as needed; agent stop never starts one.\n"
+             << "Restore configuration does not start an agent; restore run uses it only when needed.\n"
              << "Auto selects an identified, visible, empty ImgDrive device. Physical drives are refused.\n"
              << "Mounting reuses/creates an adjacent CUE, else stages a hard link or compressed copy.\n"
              << "With no embedded CUE, mounting requires a matching adjacent .cue referencing the FLAC.\n"
@@ -52,6 +57,12 @@ int run(std::vector<std::string> arguments, bool explorer) {
       flaccd::WindowsShellRegistry registry;
       std::cout << flaccd::runShellCommand(registry, arguments[1], flaccd::shellExecutablePath());
       return 0;
+   }
+   if (arguments[0] == "restore") {
+      const auto reply = flaccd::runWindowsRestore(arguments);
+      std::cout << reply.output;
+      std::cerr << reply.diagnostics;
+      return static_cast<int>(reply.exitCode);
    }
    const auto reply = flaccd::runWindowsAgentClient(std::move(arguments));
    std::cout << reply.output;

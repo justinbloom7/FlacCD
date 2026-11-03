@@ -234,6 +234,12 @@ begin
       Exit;
    end;
    if FileExists(executable) then begin
+      if RegValueExists(HKCU64, 'Software\Microsoft\Windows\CurrentVersion\Run', 'FlacCD.Restore') then begin
+         Result := runFlacCD(executable, 'restore pause');
+         if Result <> '' then begin
+            Exit;
+         end;
+      end;
       Result := runFlacCD(executable, 'agent stop --timeout 30');
       if Result = '' then begin
          { Ownership validation happens in the existing CLI, before files change. }
@@ -259,6 +265,11 @@ begin
          SuppressibleMsgBox(problem + ' Installation files are present; repair registration with flaccd shell install.',
                            mbError, MB_OK, IDOK);
       end;
+      problem := runFlacCD(ExpandConstant('{app}\flaccd.exe'), 'restore refresh');
+      if problem <> '' then begin
+         registrationFailed := True;
+         SuppressibleMsgBox(problem, mbError, MB_OK, IDOK);
+      end;
    end;
 end;
 
@@ -278,7 +289,13 @@ begin
       Exit;
    end;
    executable := ExpandConstant('{app}\flaccd.exe');
-   problem := runFlacCD(executable, 'agent stop --timeout 30');
+   problem := runFlacCD(executable, 'restore disable');
+   if problem = '' then begin
+      problem := runFlacCD(executable, 'restore pause');
+   end;
+   if problem = '' then begin
+      problem := runFlacCD(executable, 'agent stop --timeout 30');
+   end;
    if problem = '' then begin
       { Do not unregister a different installation's Explorer command. }
       if RegQueryStringValue(HKCU64, SHELL_KEY, 'FlacCD.Executable', registered) then begin

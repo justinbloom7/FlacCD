@@ -558,6 +558,43 @@ unchanged identities and, for CUEs, exact contents. Modified/replaced files and
 unknown cache contents are preserved with diagnostics. Cleanup messages name
 what was actually removed or retained.
 
+Before a saved record can block mounting, FlacCD reconciles confirmed-empty
+devices against live ImgDrive state. Stale completed mounts can be cleaned and
+remounted on the first post-login request. Unknown/missing identities, pending
+vendor operations, occupied media and ownership changes preserve resources with
+diagnostics. Automatic login restoration is available as an explicit opt-in. See
+[MountRecovery.md](docs/MountRecovery.md) for recovery rules, crash consistency,
+vendor-documented ImgDrive automount options, the separate opt-in restoration
+implementation, and reboot/Windows validation steps.
+
+To enable it from CMD after installing this version:
+
+```text
+"%LOCALAPPDATA%\Programs\FlacCD\flaccd.exe" restore enable
+"%LOCALAPPDATA%\Programs\FlacCD\flaccd.exe" restore status
+```
+
+Enabling captures current confirmed mounts and remembers future successful
+mounts. At login a short-lived `flaccd restore run` helper retries readiness for
+up to 60 seconds and exits, using the existing agent for mount/eject monitoring.
+The default installer does not enable it, and no administrator privileges are
+needed for its HKCU startup registration. Disable ImgDrive's own automount when
+using this mechanism so two restorers do not race.
+
+```text
+flaccd restore run --timeout 60
+flaccd restore forget "Y:\Music\Album.flac"
+flaccd restore disable
+```
+
+Confirmed Explorer eject or explicit unmount removes that image's restore intent.
+`agent stop` suspends entries because eject monitoring is then unavailable; use
+`restore enable` to rearm intentionally. Missing/moved files are reported and
+retained, occupied/unknown drives are never replaced, and uncertain mount attempts
+are suspended rather than replayed. Inspect `restore.log` in the managed cache
+for startup diagnostics. See [MountRecovery.md](docs/MountRecovery.md) for policies,
+limitations, custom paths and Windows login tests.
+
 A hidden **top-level** window receives `WM_DEVICECHANGE`; the agent also rescans
 every five seconds. Notifications request inspection, not immediate deletion.
 Two empty-media observations of the same identified device, at least five

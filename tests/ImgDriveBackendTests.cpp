@@ -2,6 +2,8 @@
 #include "flaccd/mount/MountAgent.h"
 #include "flaccd/mount/AgentCommand.h"
 #include "flaccd/mount/MountCueDiscovery.h"
+#include "flaccd/mount/RestoreCoordinator.h"
+#include "flaccd/mount/RestoreStartup.h"
 #include "flaccd/CueSheetWriter.h"
 #include "flaccd/PathText.h"
 
@@ -166,6 +168,9 @@ public:
       return media.contains(drive) ? media.at(drive) : flaccd::MediaState::Empty;
    }
    std::vector<flaccd::OpticalDrive> opticalDrives() override {
+      if (enumerationUnavailable) {
+         throw std::runtime_error("ImgDrive status unavailable");
+      }
       std::vector<flaccd::OpticalDrive> drives;
       for (char drive = 'D'; drive <= 'F'; ++drive) {
          if (!missing.contains(drive)) {
@@ -178,6 +183,9 @@ public:
    bool matchesLayout(char, const flaccd::TrackLayout&) override {
       return layoutMatches;
    }
+   std::string sessionIdentity() override {
+      return session;
+   }
    std::optional<std::vector<char>> emptyDrives() override {
       return available;
    }
@@ -185,6 +193,9 @@ public:
       return std::make_unique<TestLock>(mutex);
    }
    void pause(std::chrono::milliseconds) override {
+      if (onPause) {
+         onPause();
+      }
       if (readyAfterPauses > 0) {
          require(std::filesystem::exists(pendingCue), "CUE deleted after process exit");
          const auto parsed = flaccd::parseCueTextMetadata(readFile(pendingCue));
@@ -200,8 +211,11 @@ public:
    std::recursive_mutex mutex;
    flaccd::ProcessResult result;
    std::function<void()> onMount;
+   std::function<void()> onPause;
+   bool enumerationUnavailable = false;
    char redirectDrive = 0;
    std::string identitySuffix;
+   std::string session = "test-login-1";
    std::set<char> physical;
    std::set<char> missing;
    bool changeMedia = true;
@@ -897,8 +911,302 @@ void testAgentUncertain(const std::filesystem::path& fixtures) {
       const auto now = std::chrono::steady_clock::now();
       agent.reconcile(now);
       agent.reconcile(now + std::chrono::seconds(6));
-      require(std::filesystem::exists(s.files.adjacent) && !ipc(agent, {"status"}).records.empty(),
-              "uncertain device/mount/ownership was cleaned");
+      if (variant == 4) {
+         require(!std::filesystem::exists(s.files.adjacent) && ipc(agent, {"status"}).records.empty(),
+                 "fresh confirmed absence did not recover a failed-unmount record");
+      } else {
+         require(std::filesystem::exists(s.files.adjacent) && !ipc(agent, {"status"}).records.empty(),
+                 "uncertain device/mount/ownership was cleaned");
+      }
+   }
+}
+
+void testStaleRecovery(const std::filesystem::path& fixtures) {
+   for (int variant = 0; variant < 10; ++variant) {
+      Scenario s(fixtures);
+      if (variant == 8) {
+         s.files.denyAdjacent = true;
+         s.files.linkError = std::make_error_code(std::errc::cross_device_link);
+      } else if (variant == 9) {
+         writeFile(s.files.adjacent, s.cue());
+      }
+      auto backend = s.backend();
+      const auto old = backend->mount(s.source, 'D');
+      const auto originalCue = readFile(old.cuePath);
+      backend.reset(); // Crash/reboot: coordinator memory is gone; state remains.
+      s.host.media['D'] = flaccd::MediaState::Empty;
+      if (variant == 1) {
+         s.host.media['D'] = flaccd::MediaState::Ready;
+      } else if (variant == 2) {
+         s.host.media['D'] = flaccd::MediaState::Unknown;
+      } else if (variant == 3) {
+         s.host.identitySuffix = "-after-reboot";
+      } else if (variant == 4) {
+         s.host.media['D'] = flaccd::MediaState::Ready;
+         s.host.layoutMatches = false;
+      } else if (variant == 5) {
+         s.host.media['E'] = flaccd::MediaState::Ready; // Possibly moved image.
+      } else if (variant == 6) {
+         std::filesystem::remove(s.source);
+      } else if (variant == 7) {
+         s.host.onPause = [&] { s.host.media['D'] = flaccd::MediaState::Ready; };
+      }
+      backend = s.backend();
+      if (variant == 0) {
+         // A first post-login request must recover without waiting for timer ticks.
+         const auto mounted = backend->mount(s.source, 'D');
+         require(mounted.id != old.id && backend->status().size() == 1, "reboot record blocked remount");
+         require(!std::filesystem::exists(old.entryPath) && s.host.calls.size() == 2,
+                 "remount did not retire stale state, or issued an unmount command");
+         backend->unmount('D');
+      } else if (variant == 1 || variant == 4) {
+         expectError([&] { backend->mount(s.source, 'D'); },
+                     variant == 1 ? "live media TOC matches" : "different or unverified image");
+         require(backend->status().size() == 1 && readFile(old.cuePath) == originalCue && s.host.calls.size() == 1,
+                 "live/unrelated image was ejected or lost resources");
+      } else if (variant == 2 || variant == 3 || variant == 5 || variant == 7) {
+         backend->reconcileMissingMounts();
+         require(backend->status().size() == 1 && readFile(old.cuePath) == originalCue && s.host.calls.size() == 1,
+                 "unknown/changed/moved/transient media allowed cleanup");
+         if (variant != 7) {
+            expectError([&] { backend->mount(s.source, 'D'); }, "recovery deferred");
+         }
+      } else {
+         // Missing original FLAC must not prevent safe stale-resource cleanup.
+         const auto result = backend->reconcileMissingMounts();
+         require(result.find("Recovered stale mount") != std::string::npos && backend->status().empty(),
+                 "missing-source/staged/user-CUE recovery failed");
+         require(variant == 9 ? readFile(old.cuePath) == originalCue : !std::filesystem::exists(old.cuePath),
+                 "stale cleanup mishandled owned/user CUE");
+         if (variant == 8) {
+            require(!std::filesystem::exists(old.audioPath), "stale compressed copy was retained");
+         }
+         require(backend->reconcileMissingMounts().empty() && s.host.calls.size() == 1,
+                 "repeated recovery was not idempotent or automatically restored an ejected disc");
+      }
+   }
+   {
+      Scenario s(fixtures);
+      auto backend = s.backend();
+      const auto record = backend->mount(s.source, 'D');
+      s.host.enumerationUnavailable = true;
+      expectError([&] { backend->reconcileMissingMounts(); }, "status unavailable");
+      require(std::filesystem::exists(record.cuePath), "unavailable ImgDrive caused deletion");
+   }
+   {
+      Scenario s(fixtures);
+      auto backend = s.backend(std::chrono::milliseconds(2));
+      s.host.result = {7, false, "interrupted vendor call"};
+      expectError([&] { backend->mount(s.source, 'D'); });
+      s.host.media['D'] = flaccd::MediaState::Empty;
+      backend->reconcileMissingMounts();
+      const auto records = backend->status();
+      require(records.size() == 1 && records[0].record.state == flaccd::MountState::Mounting &&
+              std::filesystem::exists(records[0].record.cuePath), "unconfirmed vendor call was assumed absent");
+   }
+   {
+      Scenario s(fixtures);
+      auto backend = s.backend();
+      const auto record = backend->mount(s.source, 'D');
+      writeFile(s.host.cache / ".pending-interrupted-write", "partial phase");
+      const auto retired = s.host.cache / ".retired-mount-interrupted-cleanup";
+      std::filesystem::create_directory(retired);
+      writeFile(retired / "mount.state", "partially removed retired state");
+      s.host.media['D'] = flaccd::MediaState::Empty;
+      backend->reconcileMissingMounts();
+      require(backend->status().empty() && !std::filesystem::exists(record.entryPath) &&
+              readFile(s.host.cache / ".pending-interrupted-write") == "partial phase",
+              "interrupted metadata blocked recovery or unknown files were removed");
+   }
+   {
+      Scenario s(fixtures);
+      auto backend = s.backend();
+      flaccd::MountStateStore store(s.host.cache);
+      const auto record = store.begin('D', s.source, s.cue(), flaccd::CueLocation::Adjacent);
+      backend->reconcileMissingMounts();
+      require(backend->status().size() == 1 && std::filesystem::exists(record.entryPath) &&
+              s.host.calls.empty(), "partial unconfirmed preparation was erased or mounted");
+      const auto temporary = s.host.cache / ".test-atomic-publication";
+      const auto destination = s.host.cache / "test-published.state";
+      writeFile(temporary, "complete immutable record");
+      flaccd::publishMountMetadata(temporary, destination);
+      require(!std::filesystem::exists(temporary) && readFile(destination) == "complete immutable record",
+              "atomic publication lost metadata");
+      writeFile(temporary, "replacement must not publish");
+      expectError([&] { flaccd::publishMountMetadata(temporary, destination); }, "refusing to replace");
+      require(readFile(destination) == "complete immutable record", "atomic publication replaced an existing record");
+   }
+}
+
+void testRestoration(const std::filesystem::path& fixtures) {
+   {
+      Scenario s(fixtures);
+      flaccd::RestoreStore desired(s.host.cache);
+      flaccd::RestoreState state;
+      state.enabled = true;
+      desired.save(state);
+      flaccd::MountAgent agent(s.host, s.executable, s.host.cache);
+      require(ipc(agent, {"mount", flaccd::pathToUtf8(s.source), "--drive", "D:"}).exitCode == 0,
+              "same-login rearm fixture failed");
+      ipc(agent, {"agent", "stop"});
+      s.host.media['D'] = flaccd::MediaState::Empty;
+      flaccd::MountAgent restarted(s.host, s.executable, s.host.cache);
+      require(ipc(restarted, {"restore-step"}).exitCode == 1 && desired.read().mounts.size() == 1 &&
+              desired.read().mounts[0].suspended, "unmonitored same-login gap discarded suspended intent");
+      flaccd::captureDesiredMounts(s.host, s.host.cache, desired);
+      require(ipc(restarted, {"restore-step"}).exitCode == 3 && s.host.calls.size() == 2,
+              "explicit rearm did not allow safe restoration after a monitoring gap");
+   }
+   {
+      Scenario s(fixtures);
+      flaccd::MountAgent agent(s.host, s.executable, s.host.cache);
+      flaccd::RestoreStore desired(s.host.cache);
+      require(!desired.read().enabled && ipc(agent, {"restore-step"}).exitCode == 0,
+              "restoration was enabled by default");
+      require(ipc(agent, {"mount", flaccd::pathToUtf8(s.source), "--drive", "D:"}).exitCode == 0,
+              "mount before enabling restoration failed");
+      auto state = desired.read();
+      state.enabled = true;
+      desired.save(state);
+      flaccd::captureDesiredMounts(s.host, s.host.cache, desired);
+      require(desired.read().mounts.size() == 1, "enable did not capture confirmed mount");
+      s.host.session = "test-login-2";
+      s.host.media['D'] = flaccd::MediaState::Empty;
+      flaccd::MountAgent restarted(s.host, s.executable, s.host.cache);
+      std::array<flaccd::AgentReply, 2> replies;
+      std::thread first([&] { replies[0] = ipc(restarted, {"restore-step", "--timeout", "1"}); });
+      std::thread second([&] { replies[1] = ipc(restarted, {"restore-step", "--timeout", "1"}); });
+      first.join();
+      second.join();
+      require((replies[0].exitCode == 3 || replies[1].exitCode == 3) && s.host.calls.size() == 2,
+              "concurrent restoration duplicated a mount or failed after reboot");
+      require(ipc(restarted, {"restore-step"}).exitCode == 0 && s.host.calls.size() == 2,
+              "repeated restoration duplicated ready media");
+      require(desired.read().mounts[0].session == s.host.session, "restored intent was not bound to current login");
+      s.host.media['D'] = flaccd::MediaState::Empty;
+      const auto now = std::chrono::steady_clock::now();
+      restarted.reconcile(now);
+      restarted.reconcile(now + std::chrono::seconds(6));
+      require(desired.read().mounts.empty() && ipc(restarted, {"restore-step"}).exitCode == 0 && s.host.calls.size() == 2,
+              "Explorer eject was automatically restored");
+      s.unchanged();
+   }
+   for (int variant = 0; variant < 6; ++variant) {
+      Scenario s(fixtures);
+      flaccd::RestoreStore desired(s.host.cache);
+      flaccd::RestoreState state;
+      state.enabled = true;
+      desired.save(state);
+      flaccd::MountAgent agent(s.host, s.executable, s.host.cache);
+      require(ipc(agent, {"mount", flaccd::pathToUtf8(s.source), "--drive", "D:", "--no-copy"}).exitCode == 0,
+              "remembered manual mount failed");
+      require(desired.read().mounts.size() == 1 && desired.read().mounts[0].noCopy,
+              "future mount/policy was not remembered");
+      if (variant == 0) {
+         require(ipc(agent, {"unmount", "D:"}).exitCode == 0 && desired.read().mounts.empty(),
+                 "explicit unmount did not remove restoration intent");
+         continue;
+      }
+      if (variant == 1) {
+         require(ipc(agent, {"agent", "stop"}).exitCode == 0 && desired.read().mounts[0].suspended,
+                 "unmonitored agent stop did not suspend restoration");
+      }
+      s.host.session = "next-login";
+      s.host.media['D'] = flaccd::MediaState::Empty;
+      if (variant == 2) {
+         std::filesystem::remove(s.source);
+      } else if (variant == 3) {
+         s.host.media['E'] = flaccd::MediaState::Ready;
+      } else if (variant == 4) {
+         s.host.media['D'] = flaccd::MediaState::Unknown;
+      } else if (variant == 5) {
+         s.host.result = {7, false, "uncertain restore invocation"};
+         s.host.onMount = [&] {
+            require(desired.read().mounts[0].suspended, "restore uncertainty fence was not durable before vendor invocation");
+         };
+      }
+      flaccd::MountAgent restarted(s.host, s.executable, s.host.cache);
+      const auto result = ipc(restarted, {"restore-step", "--timeout", "1"});
+      if (variant == 1 || variant == 5) {
+         require(result.exitCode == 1 && desired.read().mounts[0].suspended,
+                 "uncertain/unmonitored restoration was not fenced");
+         const auto calls = s.host.calls.size();
+         ipc(restarted, {"restore-step"});
+         require(s.host.calls.size() == calls, "uncertain mount command was replayed");
+      } else {
+         require(result.exitCode == 3 && desired.read().mounts.size() == 1 && s.host.calls.size() == 1,
+                 "missing source/occupied/unknown drive was mounted or intent lost");
+      }
+      if (variant == 2) {
+         std::filesystem::copy_file(fixtures / "fixture-4096.flac", s.source);
+         require(ipc(restarted, {"restore-step", "--timeout", "1"}).exitCode == 3 && s.host.calls.size() == 2,
+                 "returning network/source file did not restore");
+      }
+   }
+   {
+      Scenario s(fixtures);
+      auto secondSource = s.source.parent_path() / flaccd::pathFromUtf8("Second album \u97f3.flac");
+      std::filesystem::copy_file(s.source, secondSource);
+      flaccd::RestoreStore desired(s.host.cache);
+      flaccd::RestoreState state;
+      state.enabled = true;
+      desired.save(state);
+      flaccd::MountAgent agent(s.host, s.executable, s.host.cache);
+      require(ipc(agent, {"mount", flaccd::pathToUtf8(s.source), "--drive", "D:"}).exitCode == 0 &&
+              ipc(agent, {"mount", flaccd::pathToUtf8(secondSource), "--drive", "E:"}).exitCode == 0,
+              "multiple desired fixture mounts failed");
+      s.host.session = "multiple-next-login";
+      s.host.media['D'] = flaccd::MediaState::Empty;
+      s.host.media['E'] = flaccd::MediaState::Empty;
+      flaccd::MountAgent restarted(s.host, s.executable, s.host.cache);
+      require(ipc(restarted, {"restore-step"}).exitCode == 3 && ipc(restarted, {"restore-step"}).exitCode == 3 &&
+              ipc(restarted, {"restore-step"}).exitCode == 0 && s.host.calls.size() == 4 && desired.read().mounts.size() == 2,
+              "multiple desired albums were lost, blocked, or duplicated");
+   }
+   {
+      Scenario s(fixtures);
+      flaccd::RestoreStore desired(s.host.cache);
+      flaccd::RestoreState state;
+      state.enabled = true;
+      desired.save(state);
+      flaccd::MountAgent agent(s.host, s.executable, s.host.cache);
+      require(ipc(agent, {"mount", flaccd::pathToUtf8(s.source), "--drive", "D:"}).exitCode == 0,
+              "journal fixture mount failed");
+      writeFile(s.host.cache / "restore" / ".pending-crash", "partial new snapshot");
+      require(desired.read().mounts.size() == 1, "unpublished snapshot corrupted desired list");
+      std::filesystem::path newest;
+      for (const auto& entry : std::filesystem::directory_iterator(s.host.cache / "restore")) {
+         if (entry.path().filename().string().starts_with("desired-") && entry.path() > newest) {
+            newest = entry.path();
+         }
+      }
+      writeFile(newest, "corrupt published snapshot");
+      expectError([&] { desired.read(); }, "invalid desired-mount state");
+      const auto calls = s.host.calls.size();
+      require(ipc(agent, {"restore-step"}).exitCode != 0 && s.host.calls.size() == calls,
+              "corrupt newest state fell back and resurrected old intent");
+   }
+   {
+      class Startup final : public flaccd::RestoreStartup {
+      public:
+         std::optional<std::wstring> value;
+         std::optional<std::wstring> read() override { return value; }
+         void write(const std::wstring& command) override { value = command; }
+         void remove() override { value.reset(); }
+      } startup;
+      const auto command = flaccd::restoreStartupCommand(L"C:\\Tools & \u97f3\\flaccd.exe", L"C:\\Cache % !", L"C:\\Img Drive\\ImgDrive.exe");
+      require(command.starts_with(L"\"C:\\Tools & \u97f3\\flaccd.exe\" restore run") &&
+              command.find(L"\"C:\\Cache % !\"") != std::wstring::npos, "startup paths were not quoted literally");
+      flaccd::updateRestoreStartup(startup, L"", command);
+      flaccd::updateRestoreStartup(startup, command, command);
+      require(startup.read() == command, "startup installation was not idempotent");
+      startup.value = L"unrelated program";
+      expectError([&] { flaccd::updateRestoreStartup(startup, command, {}); }, "preserved");
+      require(startup.read() == L"unrelated program", "foreign startup was deleted");
+      startup.value = command;
+      flaccd::updateRestoreStartup(startup, command, {});
+      flaccd::updateRestoreStartup(startup, command, {});
+      expectError([&] { flaccd::restoreStartupCommand(std::wstring(261, L'x'), L"cache", L"imgdrive"); }, "260");
    }
 }
 
@@ -996,6 +1304,8 @@ int main(int argumentCount, char* arguments[]) {
       testProtocol();
       testAgent(fixtures);
       testAgentUncertain(fixtures);
+      testStaleRecovery(fixtures);
+      testRestoration(fixtures);
       testAgentStop(fixtures);
       testStopInProgress(fixtures);
       std::cout << "ImgDrive strategy, ownership, recovery, race, and filesystem-fallback tests passed\n";

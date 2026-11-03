@@ -115,6 +115,19 @@ maintenance: the installer is not a cross-process mount barrier. If another
 process reopens a binary, cancel/retry after closing it rather than ignoring a
 file-in-use error. Do not force a reboot-time replacement.
 
+Optional FlacCD login restoration remains disabled on a fresh install. If the
+user enabled it, `agent stop` suspends desired entries during the maintenance
+gap. After upgrading, `restore refresh` rearms only currently confirmed live
+mounts; missing/uncertain entries stay suspended. Uninstall runs `restore disable`
+before stopping the agent, removing only its owned HKCU startup value while
+retaining the desired list and backing resources. Custom cache configuration is
+adopted from this executable's owned startup command. No new helper EXE, service,
+driver or installer dependency is introduced. See `MountRecovery.md`.
+Maintenance uses `restore pause` to suspend intent and wait for a running
+short-lived helper to exit before replacing/removing either EXE. A timeout aborts
+maintenance rather than force-terminating anything. Older installations without
+a restore startup entry continue using the existing agent-only shutdown path.
+
 Uninstall through Windows Apps or `unins000.exe`. After confirmation, uninstall
 stops the agent and calls `shell uninstall` before deleting installed files.
 Shutdown/owned-registration removal failures abort before file removal. A verb

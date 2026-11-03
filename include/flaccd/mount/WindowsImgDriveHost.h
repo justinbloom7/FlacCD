@@ -18,6 +18,7 @@ public:
    std::vector<OpticalDrive> opticalDrives() override;
    bool matchesLayout(char drive, const TrackLayout& layout) override;
    std::string layoutDiagnostic() const override;
+   std::string sessionIdentity() override;
    std::optional<std::vector<char>> emptyDrives() override;
    std::unique_ptr<MountLock> lock(const std::filesystem::path& cache,
                                    std::chrono::milliseconds timeout) override;

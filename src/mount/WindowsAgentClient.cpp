@@ -47,7 +47,8 @@ AgentReply runWindowsAgentClient(std::vector<std::string> arguments, AgentClient
                               settings.imgDrive,
                               settings.cache,
                               settings.agentExecutable,
-                              settings.endpointTag);
+                              settings.endpointTag,
+                              settings.requestTimeout);
 }
 
 }

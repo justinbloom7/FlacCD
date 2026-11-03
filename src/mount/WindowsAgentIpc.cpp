@@ -2,12 +2,14 @@
 #include "flaccd/mount/MountAgent.h"
 #include "flaccd/mount/AgentCommand.h"
 #include "flaccd/mount/WindowsImgDriveHost.h"
+#include "flaccd/mount/RestoreStore.h"
 #include "flaccd/PathText.h"
 
 #include <windows.h>
 #include <sddl.h>
 #include <dbt.h>
 
+#include <algorithm>
 #include <algorithm>
 #include <array>
 #include <fstream>
@@ -314,13 +316,16 @@ AgentReply requestWindowsAgent(const std::vector<std::string>& arguments,
                                const std::filesystem::path& imgDrive,
                                const std::filesystem::path& cache,
                                const std::filesystem::path& agentExecutable,
-                               const std::wstring& endpointTag) {
+                               const std::wstring& endpointTag,
+                               std::chrono::milliseconds requestTimeout) {
    const auto normalized = normalizeAgentCommand(arguments);
    const auto stopTimeout = agentStopTimeout(normalized);
    Endpoint endpoint(endpointTag);
    const auto request = encodeAgentRequest(normalized);
    bool started = false;
-   auto deadline = GetTickCount64() + (stopTimeout ? static_cast<ULONGLONG>(stopTimeout->count()) : 15000);
+   const bool bounded = stopTimeout.has_value() || requestTimeout.count() > 0;
+   auto deadline = GetTickCount64() + (stopTimeout ? static_cast<ULONGLONG>(stopTimeout->count()) :
+                                      requestTimeout.count() > 0 ? static_cast<ULONGLONG>(requestTimeout.count()) : 15000);
    bool queued = false;
    bool observedInstance = false;
    for (;;) {
@@ -331,9 +336,9 @@ AgentReply requestWindowsAgent(const std::vector<std::string>& arguments,
          // reuse or an already-exited process cannot invalidate the final wait.
          auto server = verifyPeer(pipe.get(), endpoint, false);
          try {
-            send(pipe.get(), request, stopTimeout ? remainingTime(deadline) : 10000);
-            auto reply = decodeAgentReply(receive(pipe.get(), stopTimeout ? remainingTime(deadline) : 1250000));
-            send(pipe.get(), "FlacCD ack 1", stopTimeout ? remainingTime(deadline) : 10000);
+            send(pipe.get(), request, bounded ? remainingTime(deadline) : 10000);
+            auto reply = decodeAgentReply(receive(pipe.get(), bounded ? remainingTime(deadline) : 1250000));
+            send(pipe.get(), "FlacCD ack 1", bounded ? remainingTime(deadline) : 10000);
             if (stopTimeout && reply.exitCode == 0) {
                return waitForAgentExit(server.get(), deadline);
             }
@@ -359,12 +364,30 @@ AgentReply requestWindowsAgent(const std::vector<std::string>& arguments,
          throw std::runtime_error("Agent exited while this request was queued; no request was submitted. Retry explicitly after shutdown.");
       }
       observedInstance = observedInstance || instanceExists || error == ERROR_PIPE_BUSY;
-      if (!stopTimeout && error == ERROR_PIPE_BUSY && !queued) {
+      if (!bounded && error == ERROR_PIPE_BUSY && !queued) {
          deadline = GetTickCount64() + 1250000;
          queued = true;
       }
       if (!stopTimeout && !started && !instanceExists && error == ERROR_FILE_NOT_FOUND) {
-         startAgent(agentExecutable, imgDrive, cache, endpointTag);
+         if (!normalized.empty() && normalized[0] == "restore-step") {
+            WindowsImgDriveHost stateHost;
+            auto lock = stateHost.lock(cache, std::chrono::milliseconds(remainingTime(deadline)));
+            if (!lock) {
+               throw std::runtime_error("cannot inspect restoration intent before starting the agent");
+            }
+            const auto desired = RestoreStore(cache).read();
+            if (!desired.enabled || desired.mounts.empty()) {
+               return {0, "No enabled desired mounts; agent not started.\n", {}, {}};
+            }
+            if (std::all_of(desired.mounts.begin(), desired.mounts.end(), [](const auto& entry) {
+               return entry.suspended;
+            })) {
+               return {1, {}, "Restoration is suspended; agent not restarted.\n", {}};
+            }
+            startAgent(agentExecutable, imgDrive, cache, endpointTag);
+         } else {
+            startAgent(agentExecutable, imgDrive, cache, endpointTag);
+         }
          started = true;
       }
       if (remainingTime(deadline) == 0) {

@@ -40,15 +40,24 @@ std::string makeId() {
    return text.str();
 }
 
-void writeMetadata(const std::filesystem::path& path, const std::string& text) {
+void writeMetadata(const std::filesystem::path& path,
+                    const std::string& text,
+                    const std::filesystem::path& temporaryDirectory) {
    if (text.size() > 1024 * 1024) {
       throw std::runtime_error("mount metadata too large");
    }
    MountFileSystem files;
-   const auto error = files.createCueExclusive(path, text);
+   // Publish only a complete, flushed immutable record. The caller holds the
+   // cache lock; incomplete temporary writes never masquerade as phase markers.
+   if (mountPathExists(path)) {
+      throw std::runtime_error("mount metadata already exists; refusing replacement");
+   }
+   const auto temporary = temporaryDirectory / (".pending-" + makeId());
+   const auto error = files.createCueExclusive(temporary, text);
    if (error) {
       throw std::filesystem::filesystem_error("exclusive mount metadata creation", path, error);
    }
+   publishMountMetadata(temporary, path);
 }
 
 bool regular(const std::filesystem::path& path) {
@@ -78,6 +87,15 @@ void removeMetadata(const std::filesystem::path& directory) {
    std::filesystem::remove(directory / "mount.state");
    std::filesystem::remove(directory / "detached");
    std::filesystem::remove(directory);
+}
+
+void retireMetadata(const std::filesystem::path& directory) {
+   // Resources have already been safely removed. Retire the active record
+   // atomically before deleting its metadata so a crash mid-deletion cannot
+   // leave a malformed mount-* directory blocking every future request.
+   const auto retired = directory.parent_path() / (".retired-" + pathToUtf8(directory.filename()));
+   publishMountMetadata(directory, retired);
+   removeMetadata(retired);
 }
 
 }
@@ -116,7 +134,7 @@ MountStateStore::MountStateStore(const std::filesystem::path& cacheRoot, MountFi
       if (!std::filesystem::is_empty(root)) {
          throw std::runtime_error("refusing nonempty cache without a FlacCD ownership marker");
       }
-      writeMetadata(marker, std::string(CACHE_MAGIC));
+      writeMetadata(marker, std::string(CACHE_MAGIC), root);
    }
    if (readMountCue(marker) != CACHE_MAGIC) {
       throw std::runtime_error("invalid FlacCD cache ownership marker");
@@ -238,8 +256,8 @@ MountRecord MountStateStore::begin(char drive,
    std::ostringstream manifest;
    manifest << STATE_MAGIC << '\n' << id << ' ' << drive << '\n' << std::quoted(pathToUtf8(source)) << '\n'
             << std::quoted(text) << '\n' << static_cast<int>(location) << '\n';
-   writeMetadata(prepared / "mount.state", manifest.str());
-   std::filesystem::rename(prepared, directory);
+   writeMetadata(prepared / "mount.state", manifest.str(), root);
+   publishMountMetadata(prepared, directory);
    return load(directory);
 }
 
@@ -253,7 +271,7 @@ MountRecord MountStateStore::complete(const MountRecord& record, AudioStorage st
    std::ostringstream text;
    text << record.id << ' ' << static_cast<int>(storage) << ' ' << std::quoted(cueIdentity) << ' '
         << std::quoted(audioIdentity) << '\n';
-   writeMetadata(actual.entryPath / "resources.state", text.str());
+   writeMetadata(actual.entryPath / "resources.state", text.str(), root);
    auto result = load(actual.entryPath);
    mark(result, MountState::Prepared);
    return load(actual.entryPath);
@@ -292,7 +310,7 @@ void MountStateStore::mark(const MountRecord& record, MountState state) {
          throw std::runtime_error("invalid phase marker");
       }
    } else {
-      writeMetadata(marker, record.id);
+      writeMetadata(marker, record.id, root);
    }
 }
 
@@ -308,7 +326,7 @@ MountRecord MountStateStore::bindDevice(const MountRecord& record,
    const auto name = actual.deviceIdentity.empty() ? "device.state" : "actual.state";
    std::ostringstream text;
    text << record.id << ' ' << actualDrive << ' ' << std::quoted(identity) << ' ' << std::quoted(selector) << '\n';
-   writeMetadata(actual.entryPath / name, text.str());
+   writeMetadata(actual.entryPath / name, text.str(), root);
    return load(actual.entryPath);
 }
 
@@ -317,7 +335,7 @@ void MountStateStore::discardEmptyPreparation(const MountRecord& record) {
    if (actual.resourcesReady || actual.state != MountState::Preparing) {
       throw std::runtime_error("cannot discard active mount resources");
    }
-   removeMetadata(actual.entryPath);
+   retireMetadata(actual.entryPath);
 }
 
 void MountStateStore::removeDetached(const MountRecord& record) {
@@ -373,7 +391,7 @@ void MountStateStore::removeDetached(const MountRecord& record) {
    if (actual.location == CueLocation::Staged && mountPathExists(actual.audioPath)) {
       files.removeOwned(actual.audioPath, actual.audioIdentity);
    }
-   removeMetadata(actual.entryPath);
+   retireMetadata(actual.entryPath);
 }
 
 }

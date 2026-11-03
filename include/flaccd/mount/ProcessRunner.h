@@ -40,6 +40,9 @@ public:
    virtual std::string layoutDiagnostic() const {
       return "TOC unavailable or differs from expected layout";
    }
+   virtual std::string sessionIdentity() {
+      return {};
+   }
    // nullopt means no verified, machine-readable enumeration is available.
    virtual std::optional<std::vector<char>> emptyDrives() = 0;
    virtual std::unique_ptr<MountLock> lock(const std::filesystem::path& cache,

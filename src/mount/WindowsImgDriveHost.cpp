@@ -7,6 +7,7 @@
 #include <shlobj.h>
 #include <setupapi.h>
 #include <cfgmgr32.h>
+#include <sddl.h>
 
 #include <algorithm>
 #include <array>
@@ -295,7 +296,8 @@ MediaState WindowsImgDriveHost::inspectDrive(char drive) {
    if (DeviceIoControl(device.get(), IOCTL_STORAGE_CHECK_VERIFY2, nullptr, 0, nullptr, 0, &returned, nullptr)) {
       return MediaState::Ready;
    }
-   return GetLastError() == ERROR_NOT_READY ? MediaState::Empty : MediaState::Unknown;
+   const DWORD error = GetLastError();
+   return error == ERROR_NOT_READY || error == ERROR_NO_MEDIA_IN_DRIVE ? MediaState::Empty : MediaState::Unknown;
 }
 
 bool WindowsImgDriveHost::matchesLayout(char drive, const TrackLayout& layout) {
@@ -351,6 +353,36 @@ bool WindowsImgDriveHost::matchesLayout(char drive, const TrackLayout& layout) {
 
 std::string WindowsImgDriveHost::layoutDiagnostic() const {
    return tocDiagnostic;
+}
+
+std::string WindowsImgDriveHost::sessionIdentity() {
+   HANDLE rawToken = nullptr;
+   if (!OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &rawToken)) {
+      return {};
+   }
+   WindowsHandle token(rawToken);
+   DWORD size = 0;
+   GetTokenInformation(token.get(), TokenGroups, nullptr, 0, &size);
+   if (size == 0) {
+      return {};
+   }
+   std::vector<std::byte> buffer(size);
+   if (!GetTokenInformation(token.get(), TokenGroups, buffer.data(), size, &size)) {
+      return {};
+   }
+   const auto* groups = reinterpret_cast<const TOKEN_GROUPS*>(buffer.data());
+   for (DWORD index = 0; index < groups->GroupCount; ++index) {
+      if ((groups->Groups[index].Attributes & SE_GROUP_LOGON_ID) == SE_GROUP_LOGON_ID) {
+         wchar_t* sid = nullptr;
+         if (!ConvertSidToStringSidW(groups->Groups[index].Sid, &sid)) {
+            return {};
+         }
+         const auto identity = pathToUtf8(std::filesystem::path(sid));
+         LocalFree(sid);
+         return identity;
+      }
+   }
+   return {};
 }
 
 std::vector<OpticalDrive> WindowsImgDriveHost::opticalDrives() {

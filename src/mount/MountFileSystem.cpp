@@ -36,6 +36,9 @@ bool writeBytes(FileHandle file, const char* data, std::size_t size) {
 bool closeFile(FileHandle file) {
    return CloseHandle(file) != 0;
 }
+bool flushFile(FileHandle file) {
+   return FlushFileBuffers(file) != 0;
+}
 std::string handleIdentity(FileHandle file) {
    BY_HANDLE_FILE_INFORMATION info{};
    if (!GetFileInformationByHandle(file, &info)) {
@@ -73,6 +76,9 @@ bool writeBytes(FileHandle file, const char* data, std::size_t size) {
 }
 bool closeFile(FileHandle file) {
    return ::close(file) == 0;
+}
+bool flushFile(FileHandle file) {
+   return ::fsync(file) == 0;
 }
 std::string handleIdentity(FileHandle file) {
    struct stat info{};
@@ -117,6 +123,23 @@ bool regular(const std::filesystem::path& path) {
 
 bool mountPathExists(const std::filesystem::path& path) {
    return std::filesystem::exists(std::filesystem::symlink_status(path));
+}
+
+void publishMountMetadata(const std::filesystem::path& temporary, const std::filesystem::path& destination) {
+   if (mountPathExists(destination)) {
+      throw std::runtime_error("refusing to replace existing mount metadata: " + pathToUtf8(destination));
+   }
+#ifdef _WIN32
+   if (!MoveFileExW(temporary.c_str(), destination.c_str(), MOVEFILE_WRITE_THROUGH)) {
+      throw std::system_error(lastError(), "publish mount metadata");
+   }
+#else
+   std::filesystem::rename(temporary, destination);
+   File directory(::open(destination.parent_path().c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW));
+   if (directory.handle == INVALID_FILE || !flushFile(directory.handle)) {
+      throw std::system_error(lastError(), "flush mount metadata directory");
+   }
+#endif
 }
 
 std::string readMountCue(const std::filesystem::path& path) {
@@ -171,7 +194,7 @@ std::error_code MountFileSystem::createCueExclusive(const std::filesystem::path&
 #endif
       return error;
    }
-   if (!writeBytes(file.handle, text.data(), text.size()) || !file.close()) {
+   if (!writeBytes(file.handle, text.data(), text.size()) || !flushFile(file.handle) || !file.close()) {
       throw std::runtime_error("failed writing exclusively created CUE; preserve it for inspection: " + pathToUtf8(path));
    }
    return {};
@@ -232,7 +255,7 @@ void MountFileSystem::copyCompressed(const std::filesystem::path& source,
       }
       copied += count;
    }
-   if (input.bad() || copied != bytes || !output.close() || identity(source) != before) {
+   if (input.bad() || copied != bytes || !flushFile(output.handle) || !output.close() || identity(source) != before) {
       throw std::runtime_error("compressed FLAC copy incomplete or source changed; staging retained, never mounted");
    }
    // Bounded second pass verifies exact encoded bytes, independent of decoding.

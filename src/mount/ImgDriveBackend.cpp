@@ -114,9 +114,10 @@ ImgDriveBackend::ImgDriveBackend(ProcessRunner& host,
                                  const std::filesystem::path& cacheRoot,
                                  std::chrono::milliseconds operationTimeout,
                                  MountFileSystem* fileSystem,
-                                 MountLog logger)
+                                 MountLog logger,
+                                 MountDetached onDetached)
    : runner(host), executable(validateExecutable(executablePath)), timeout(validateTimeout(operationTimeout)),
-     files(fileSystem ? *fileSystem : nativeFiles), log(std::move(logger)),
+     files(fileSystem ? *fileSystem : nativeFiles), log(std::move(logger)), detached(std::move(onDetached)),
      guard(runner.lock(cacheRoot, timeout)), store(cacheRoot, &files) {
    if (!guard) {
       throw std::runtime_error("mount-state lock was not acquired");
@@ -138,6 +139,10 @@ MountRecord ImgDriveBackend::mount(const std::filesystem::path& source,
                                    std::string_view layoutSource,
                                    const MountPrepared& prepared,
                                    bool noCopy) {
+   const auto recovered = reconcileMissingMounts();
+   if (log && !recovered.empty()) {
+      log(recovered);
+   }
    const auto original = std::filesystem::canonical(source);
    const auto metadata = FlacMetadataInspector{}.inspect(original);
    const auto layout = discoverMountLayout(metadata, original, layoutSource);
@@ -171,8 +176,27 @@ MountRecord ImgDriveBackend::mount(const std::filesystem::path& source,
    }
    for (const auto& record : store.records()) {
       if (record.drive == drive || record.actualDrive == drive || record.deviceIdentity == target->identity) {
+         const auto* actual = findDevice(before, record.deviceIdentity);
+         if (!actual || !actual->imgDrive || actual->media != MediaState::Ready) {
+            auto reason = recoveryDiagnostic(record);
+            if (reason.empty()) {
+               reason = "media absence confirmed but owned resources could not be cleaned; inspect recovery diagnostics";
+            }
+            throw std::runtime_error("saved FlacCD mount is not proof of live media; recovery deferred: " +
+                                     reason + "; CUE/state retained; inspect flaccd status");
+         }
+         std::string association = "live media association could not be verified";
+         try {
+            const auto savedMetadata = FlacMetadataInspector{}.inspect(record.audioPath);
+            const auto savedLayout = TrackLayout::fromText(savedMetadata, parseCueTextMetadata(record.cueText));
+            association = runner.matchesLayout(actual->letter, savedLayout) ?
+               "live media TOC matches (TOC alone does not uniquely identify an image)" :
+               "different or unverified image is present; " + runner.layoutDiagnostic();
+         } catch (const std::exception& error) {
+            association += ": " + std::string(error.what());
+         }
          throw std::runtime_error("drive already has FlacCD state (" + mountStateName(record.state) +
-                                  "); use flaccd status or flaccd unmount before remounting");
+                                  "); " + association + "; resources retained; inspect flaccd status");
       }
    }
    if (runner.inspectDrive(drive) != MediaState::Empty) {
@@ -341,7 +365,58 @@ MountRecord ImgDriveBackend::prepare(char drive,
    return store.complete(intent, storage);
 }
 
-std::string ImgDriveBackend::cleanupEjected(const MountRecord& record) {
+std::string ImgDriveBackend::recoveryDiagnostic(const MountRecord& record) {
+   if (!record.resourcesReady || !record.deviceConfirmed ||
+       (record.state != MountState::Mounted && record.state != MountState::Unmounting && record.state != MountState::Detached)) {
+      return "mount/preparation was never confirmed; an interrupted vendor operation may still be pending";
+   }
+   const auto drives = runner.opticalDrives();
+   const auto* actual = findDevice(drives, record.deviceIdentity);
+   if (!actual || !actual->imgDrive || record.deviceIdentity.empty()) {
+      return "recorded ImgDrive device is unavailable or its identity changed (unknown, not confirmed missing)";
+   }
+   if (actual->media != MediaState::Empty) {
+      return actual->media == MediaState::Ready ? "recorded device contains live media" :
+                                                "recorded device media state is unknown";
+   }
+   for (const auto& other : drives) {
+      if (other.identity.empty() || other.media == MediaState::Unknown || other.media == MediaState::Missing ||
+          (other.identity != record.deviceIdentity && other.imgDrive && other.media != MediaState::Empty)) {
+         return "another virtual or uncertain optical drive might still use the image; cleanup deferred";
+      }
+   }
+   return {};
+}
+
+std::string ImgDriveBackend::reconcileMissingMounts() {
+   std::vector<MountRecord> candidates;
+   for (const auto& record : store.records()) {
+      if (recoveryDiagnostic(record).empty()) {
+         candidates.push_back(record);
+      }
+   }
+   std::string result;
+   if (!candidates.empty()) {
+      // Serialized by the cache lock. The real host waits; mocks can simulate
+      // a media change/readiness transition between independent observations.
+      runner.pause(std::chrono::milliseconds(500));
+      for (const auto& record : candidates) {
+         const auto diagnostic = recoveryDiagnostic(record);
+         if (!diagnostic.empty()) {
+            result += "Recovery deferred: " + diagnostic + "\n";
+            continue;
+         }
+         try {
+            result += "Recovered stale mount " + record.id + ":\n" + cleanupEjected(record, true);
+         } catch (const std::exception& error) {
+            result += "Recovery cleanup deferred; resources/state retained: " + std::string(error.what()) + "\n";
+         }
+      }
+   }
+   return result;
+}
+
+std::string ImgDriveBackend::cleanupEjected(const MountRecord& record, bool recovery) {
    store.validate(record);
    const auto drives = runner.opticalDrives();
    const auto* actual = findDevice(drives, record.deviceIdentity);
@@ -351,8 +426,17 @@ std::string ImgDriveBackend::cleanupEjected(const MountRecord& record) {
    if (record.state == MountState::Preparing || record.state == MountState::Prepared || record.state == MountState::Mounting) {
       throw std::runtime_error("cleanup deferred: mount was never confirmed; pending resources preserved");
    }
+   if (recovery) {
+      const auto diagnostic = recoveryDiagnostic(record);
+      if (!diagnostic.empty()) {
+         throw std::runtime_error(diagnostic);
+      }
+   }
    const bool cuePresent = mountPathExists(record.cuePath);
    const bool audioPresent = record.location == CueLocation::Staged && mountPathExists(record.audioPath);
+   if (detached) {
+      detached(record);
+   }
    store.mark(record, MountState::Detached);
    store.removeDetached(record);
    std::string result = "Detached " + std::string(1, actual->letter) + ":; ";
