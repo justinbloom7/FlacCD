@@ -9,19 +9,27 @@ The Start Menu entry opens this usage document in Notepad. There is no GUI yet.
 
 Install [Inno Setup 6.3 or newer](https://jrsoftware.org/isinfo.php) on the Windows
 build machine. It is a build prerequisite, not a runtime dependency. In MSYS2
-UCRT64, stop the development agent before rebuilding:
+UCRT64, stop the development agent before rebuilding (skip this command on a
+first build, or use the installed copy's CLI if that owns the running agent):
 
 ```bash
 ./build-windows/flaccd.exe agent stop
-cmake -S . -B build-windows -G Ninja -DCMAKE_BUILD_TYPE=Release \
-  -DFLACCD_ISCC='C:/Program Files (x86)/Inno Setup 6/ISCC.exe'
+```
+
+The developer uses Inno Setup **7**, installed under `C:/Program Files`:
+
+```bash
+cmake -S . -B build-windows -G Ninja -DCMAKE_BUILD_TYPE=Release "-DFLACCD_ISCC=C:/Program Files/Inno Setup 7/ISCC.exe"
 cmake --build build-windows
 ctest --test-dir build-windows --output-on-failure
 cmake --build build-windows --target flaccd-installer
 ```
 
-The explicit ISCC path is optional if CMake finds it. The target requires a native
-Windows x64 build and creates
+The explicit ISCC path is optional if CMake finds it; specify it for Inno Setup 7
+if automatic discovery does not find your installation. The target requires a
+native Windows x64 build environment; see the
+[README](../README.md#building-on-windows-with-msys2-ucrt64) for the MSYS2 UCRT64
+packages and end-user installation prerequisites. It creates
 `build-windows/installer/Release/FlacCD-0.1.0-windows-x64-setup.exe` for the current
 version. Change `project(FlacCD VERSION ...)` in `CMakeLists.txt` for future
 MAJOR.MINOR.PATCH releases; keep the installer's AppId stable across upgrades.

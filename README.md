@@ -7,8 +7,103 @@ it does not decode audio or mount a drive. `flaccd-export` uses the core CDDA
 reader for full-disc, track, range, split-track, and BIN/CUE exports. No custom
 Windows driver is built or installed.
 
+## Installing on Windows
+
+End users need Windows 10/11 **x64** and a separately installed, working
+[ImgDrive](https://www.yubsoft.com/imgdrive/) virtual CD backend. FlacCD's
+installer includes its executables and any required non-system runtime DLLs;
+GCC/C++ runtimes and libFLAC are linked statically when supported. You do **not**
+need MSYS2, MinGW, Git Bash, CMake, Inno Setup, or a separate libFLAC installation
+on the destination computer.
+
+1. Install ImgDrive using its vendor installer and create an available virtual
+   drive. Its driver installation is separate from FlacCD and may require
+   administrator approval.
+2. Run `FlacCD-<version>-windows-x64-setup.exe` as your normal Windows user.
+   FlacCD defaults to `%LOCALAPPDATA%\Programs\FlacCD` without requiring elevation.
+3. Right-click a FLAC album containing an embedded CUE sheet and choose
+   **Mount as Audio CD** (under **Show more options** on Windows 11).
+
+The FlacCD installer registers the Explorer command and installs its runtime
+dependencies from the audited deployment. **It does not download, install, or
+redistribute ImgDrive or its driver.** Missing ImgDrive produces an advisory;
+FlacCD installation can finish, but mounting requires ImgDrive. For a custom
+ImgDrive location, configure the user environment variable `FLACCD_IMGDRIVE`,
+or use `--imgdrive` with the CLI. The default FLAC file association is unchanged.
+
+Run a newer installer to upgrade. It stops the agent gracefully and preserves
+mount records, backing files, and user cache/state. Uninstall through Windows
+Apps; preferably unmount managed discs first. Uninstall does not remove ImgDrive
+or delete retained mount resources. See [WindowsInstaller.md](docs/WindowsInstaller.md)
+for maintenance and recovery details.
+
+## Building on Windows with MSYS2 UCRT64
+
+Build prerequisites are Git (or a source checkout), a C++20 compiler, CMake
+3.20+, Ninja, pkg-config/pkgconf, and libFLAC development headers/libraries
+1.3.3+. Use the **MSYS2 UCRT64** environment consistently; do not mix its
+libraries with MSYS or MINGW64 libraries. Inno Setup is needed only to build the
+setup EXE. ImgDrive is needed for real mounting tests, not compilation or mock
+unit tests.
+
+On a fresh [MSYS2](https://www.msys2.org/) development installation, open its
+UCRT64 shell and install missing build packages:
+
+```bash
+pacman -S --needed git mingw-w64-ucrt-x86_64-toolchain \
+  mingw-w64-ucrt-x86_64-cmake mingw-w64-ucrt-x86_64-ninja \
+  mingw-w64-ucrt-x86_64-pkgconf mingw-w64-ucrt-x86_64-flac
+```
+
+These are build-machine dependencies, not packages users must install to run
+FlacCD. See the [MSYS2 environment guide](https://www.msys2.org/docs/environments/)
+and its [FLAC](https://packages.msys2.org/packages/mingw-w64-ucrt-x86_64-flac)
+and [pkgconf](https://packages.msys2.org/packages/mingw-w64-ucrt-x86_64-pkgconf)
+package pages.
+
+Install [Inno Setup](https://jrsoftware.org/isinfo.php) separately. The command
+below uses your Inno Setup **7** installation at
+`C:/Program Files/Inno Setup 7/ISCC.exe`; adjust the path if yours differs.
+Inno Setup 6.3+ is the script's minimum version. From the FlacCD repository root
+in UCRT64:
+
+```bash
+# Before rebuilding an existing checkout, stop the running development agent:
+./build-windows/flaccd.exe agent stop
+```
+
+Skip that stop command on a first build when the executable does not exist.
+If the running agent belongs to an installed copy, use that copy's `flaccd.exe`
+to stop it. This releases the agent EXE lock without unmounting active discs.
+
+```bash
+cmake -S . -B build-windows -G Ninja -DCMAKE_BUILD_TYPE=Release "-DFLACCD_ISCC=C:/Program Files/Inno Setup 7/ISCC.exe"
+cmake --build build-windows
+ctest --test-dir build-windows --output-on-failure
+cmake --build build-windows --target flaccd-installer
+```
+
+Use **Release**, not `Releas`. The installer target runs the existing deployment
+audit and clean-PATH CMD/PowerShell smoke checks before compiling the setup EXE.
+When ISCC is configured, CTest also registers the installer build test. Build
+outputs include:
+
+- `build-windows/installer/Release/FlacCD-<version>-windows-x64-setup.exe`:
+  distributable installer.
+- `build-windows/deploy/Release/FlacCD/`: audited portable deployment folder.
+- Optional ZIP: run `cmake --build build-windows --target flaccd-package`.
+
+Version numbers come from `project(FlacCD VERSION ...)` in `CMakeLists.txt`.
+Distribute the installer or complete staged folder/ZIP, rather than individual
+EXEs from the build directory. The staged package supplies required DLLs; no
+MSYS2 directories need to be added to the destination computer's PATH.
+
+## Building on Linux
+
 Build dependencies: a C++20 compiler, CMake 3.20 or newer, Ninja, pkg-config,
-and libFLAC development headers/library (1.3.3 or newer).
+and libFLAC development headers/library (1.3.3 or newer). Windows mounting and
+the Inno Setup installer require Windows; portable core/export tests run natively
+on Linux.
 
 ```sh
 cmake -S . -B build -G Ninja
@@ -17,8 +112,8 @@ ctest --test-dir build --output-on-failure
 ./build/flaccd-info /path/to/disc.flac
 ```
 
-For Windows delivery without MSYS2/MinGW installed on the destination machine,
-configure a Release build and run `cmake --build build-windows --target flaccd-package`.
+For more detail about Windows delivery without MSYS2/MinGW on the destination,
+see the deployment documentation below.
 The audited folder/ZIP contains all five applications and any required non-system
 DLLs. MinGW GCC/C++ runtimes are static by default; winpthreads is static when a
 link probe supports it. MinGW builds prefer a verified real `libFLAC.a` (with
