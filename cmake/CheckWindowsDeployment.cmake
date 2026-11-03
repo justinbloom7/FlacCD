@@ -59,9 +59,17 @@ set(systemRoot "$ENV{SystemRoot}")
 if(NOT systemRoot)
    message(FATAL_ERROR "Windows SystemRoot is not available")
 endif()
-execute_process(COMMAND "${systemRoot}/System32/cmd.exe" /D /C Smoke.cmd
-                WORKING_DIRECTORY "${smokeDirectory}" TIMEOUT 30
-                RESULT_VARIABLE cmdResult OUTPUT_VARIABLE cmdOutput ERROR_VARIABLE cmdError)
+execute_process(
+   COMMAND "${smokeDirectory}/Smoke.cmd"
+   WORKING_DIRECTORY "${smokeDirectory}"
+   TIMEOUT 30
+   RESULT_VARIABLE cmdResult
+   OUTPUT_VARIABLE cmdOutput
+   ERROR_VARIABLE cmdError
+)
+#execute_process(COMMAND "${systemRoot}/System32/cmd.exe" /D /C Smoke.cmd
+#WORKING_DIRECTORY "${smokeDirectory}" TIMEOUT 30
+#RESULT_VARIABLE cmdResult OUTPUT_VARIABLE cmdOutput ERROR_VARIABLE cmdError)
 file(WRITE "${smokeDirectory}/Cmd.txt" "${cmdOutput}\n${cmdError}")
 if(NOT cmdResult EQUAL 0)
    message(FATAL_ERROR "Clean-PATH CMD startup failed (${cmdResult}); see ${smokeDirectory}/Cmd.txt")
