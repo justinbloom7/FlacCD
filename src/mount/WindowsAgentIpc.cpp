@@ -1,5 +1,6 @@
 #include "flaccd/mount/WindowsAgentIpc.h"
 #include "flaccd/mount/MountAgent.h"
+#include "flaccd/mount/AgentCommand.h"
 #include "flaccd/mount/WindowsImgDriveHost.h"
 #include "flaccd/PathText.h"
 
@@ -10,8 +11,10 @@
 #include <algorithm>
 #include <array>
 #include <fstream>
+#include <memory>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 
 namespace flaccd {
 namespace {
@@ -24,6 +27,8 @@ public:
       if (value && value != INVALID_HANDLE_VALUE) {
          CloseHandle(value);
       }
+   }
+   Handle(Handle&& other) noexcept : value(std::exchange(other.value, nullptr)) {
    }
    Handle(const Handle&) = delete;
    Handle& operator=(const Handle&) = delete;
@@ -173,17 +178,54 @@ std::string receive(HANDLE pipe, DWORD timeout, HANDLE stop = nullptr) {
    return text;
 }
 
-DWORD verifyPeer(HANDLE pipe, const Endpoint& endpoint, bool server) {
+Handle verifyPeer(HANDLE pipe, const Endpoint& endpoint, bool server) {
    ULONG id = 0;
    const bool queried = server ? GetNamedPipeClientProcessId(pipe, &id) != 0 : GetNamedPipeServerProcessId(pipe, &id) != 0;
    if (!queried) {
       throw failure("query IPC peer");
    }
-   Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, id));
-   if (!process.get() || userSid(process.get()) != endpoint.sid) {
+   Handle process(OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION | SYNCHRONIZE, FALSE, id));
+   if (!process.get()) {
+      throw failure("open IPC peer process for identity/exit verification");
+   }
+   if (userSid(process.get()) != endpoint.sid) {
       throw std::runtime_error("IPC peer is not the current user");
    }
-   return id;
+   return process;
+}
+
+bool agentInstanceExists(const Endpoint& endpoint) {
+   Handle instance(OpenMutexW(SYNCHRONIZE, FALSE, endpoint.mutex.c_str()));
+   if (instance.get()) {
+      return true;
+   }
+   if (GetLastError() == ERROR_FILE_NOT_FOUND) {
+      return false;
+   }
+   throw failure("query existing agent instance");
+}
+
+DWORD remainingTime(ULONGLONG deadline) {
+   const auto now = GetTickCount64();
+   return now < deadline ? static_cast<DWORD>(deadline - now) : 0;
+}
+
+AgentReply waitForAgentExit(HANDLE process, ULONGLONG deadline) {
+   const auto wait = WaitForSingleObject(process, remainingTime(deadline));
+   if (wait == WAIT_TIMEOUT) {
+      return {1, {}, "Agent process " + std::to_string(GetProcessId(process)) + " did not exit before the shutdown timeout. In-progress work may still finish; mounts/state are retained. No forced termination was performed.\n", {}};
+   }
+   if (wait != WAIT_OBJECT_0) {
+      throw failure("wait for complete agent process exit");
+   }
+   DWORD code = 0;
+   if (!GetExitCodeProcess(process, &code)) {
+      throw failure("query exited agent status");
+   }
+   if (code != 0) {
+      return {1, {}, "Agent exited with status " + std::to_string(code) + "; inspect its log. Saved mount state is retained.\n", {}};
+   }
+   return {0, "Agent stopped; active mounts/state retained. Eject monitoring resumes when the agent restarts.\n", {}, {}};
 }
 
 void startAgent(const std::filesystem::path& path,
@@ -273,44 +315,65 @@ AgentReply requestWindowsAgent(const std::vector<std::string>& arguments,
                                const std::filesystem::path& cache,
                                const std::filesystem::path& agentExecutable,
                                const std::wstring& endpointTag) {
+   const auto normalized = normalizeAgentCommand(arguments);
+   const auto stopTimeout = agentStopTimeout(normalized);
    Endpoint endpoint(endpointTag);
-   const auto request = encodeAgentRequest(arguments);
+   const auto request = encodeAgentRequest(normalized);
    bool started = false;
-   auto deadline = GetTickCount64() + 15000;
+   auto deadline = GetTickCount64() + (stopTimeout ? static_cast<ULONGLONG>(stopTimeout->count()) : 15000);
    bool queued = false;
+   bool observedInstance = false;
    for (;;) {
       Handle pipe(CreateFileW(endpoint.pipe.c_str(), GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
-                               FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, nullptr));
+                             FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, nullptr));
       if (pipe.get() != INVALID_HANDLE_VALUE) {
-         const auto serverId = verifyPeer(pipe.get(), endpoint, false);
-         send(pipe.get(), request, 10000);
-         // A disconnected/timed-out request is NEVER automatically replayed.
-         auto reply = decodeAgentReply(receive(pipe.get(), 1250000));
-         send(pipe.get(), "FlacCD ack 1", 10000);
-         if (!arguments.empty() && arguments[0] == "agent-stop" && reply.exitCode == 0) {
-            Handle server(OpenProcess(SYNCHRONIZE, FALSE, serverId));
-            if (server.get() && WaitForSingleObject(server.get(), 10000) != WAIT_OBJECT_0) {
-               reply.diagnostics += "Agent shutdown is still pending; wait before restarting.\n";
+         // Retain a verified process handle before submitting shutdown. PID
+         // reuse or an already-exited process cannot invalidate the final wait.
+         auto server = verifyPeer(pipe.get(), endpoint, false);
+         try {
+            send(pipe.get(), request, stopTimeout ? remainingTime(deadline) : 10000);
+            auto reply = decodeAgentReply(receive(pipe.get(), stopTimeout ? remainingTime(deadline) : 1250000));
+            send(pipe.get(), "FlacCD ack 1", stopTimeout ? remainingTime(deadline) : 10000);
+            if (stopTimeout && reply.exitCode == 0) {
+               return waitForAgentExit(server.get(), deadline);
             }
+            return reply;
+         } catch (const std::exception&) {
+            if (stopTimeout) {
+               // Stop is idempotent. A lost reply/ack must not prevent exit or
+               // turn a completed process exit into an ambiguous success.
+               return waitForAgentExit(server.get(), deadline);
+            }
+            throw; // Never replay a submitted mount/unmount after disconnect.
          }
-         return reply;
       }
       const auto error = GetLastError();
       if (error != ERROR_PIPE_BUSY && error != ERROR_FILE_NOT_FOUND) {
          throw failure("connect to current-user agent");
       }
-      if (error == ERROR_PIPE_BUSY && !queued) {
+      const bool instanceExists = agentInstanceExists(endpoint);
+      if (stopTimeout && !instanceExists) {
+         return {0, "Agent is not running; nothing to stop.\n", {}, {}};
+      }
+      if (!stopTimeout && observedInstance && !instanceExists) {
+         throw std::runtime_error("Agent exited while this request was queued; no request was submitted. Retry explicitly after shutdown.");
+      }
+      observedInstance = observedInstance || instanceExists || error == ERROR_PIPE_BUSY;
+      if (!stopTimeout && error == ERROR_PIPE_BUSY && !queued) {
          deadline = GetTickCount64() + 1250000;
          queued = true;
       }
-      if (!started && error == ERROR_FILE_NOT_FOUND) {
+      if (!stopTimeout && !started && !instanceExists && error == ERROR_FILE_NOT_FOUND) {
          startAgent(agentExecutable, imgDrive, cache, endpointTag);
          started = true;
       }
-      if (GetTickCount64() >= deadline) {
+      if (remainingTime(deadline) == 0) {
+         if (stopTimeout) {
+            throw std::runtime_error("Agent is busy/starting and the stop request could not be submitted before timeout; in-progress work and mount state were not interrupted. Retry agent stop with a longer --timeout.");
+         }
          throw std::runtime_error("agent connection timed out; inspect cache/agent.log; no request was submitted");
       }
-      WaitNamedPipeW(endpoint.pipe.c_str(), 200);
+      WaitNamedPipeW(endpoint.pipe.c_str(), std::min<DWORD>(200, remainingTime(deadline)));
       Sleep(25);
    }
 }
@@ -326,6 +389,11 @@ int runWindowsAgent(const std::filesystem::path& imgDrive,
    if (GetLastError() == ERROR_ALREADY_EXISTS) {
       return 0;
    }
+   // The instance reservation belongs to the process, not just the pipe loop.
+   // Keep RAII ownership through main/CRT shutdown so a concurrent/repeated stop
+   // cannot mistake a draining process for an absent agent and restart it.
+   static std::unique_ptr<Handle> processInstance;
+   processInstance = std::make_unique<Handle>(std::move(instance));
    WindowsImgDriveHost host;
    // Validate configuration/ownership before opening the IPC endpoint or log.
    { ImgDriveBackend validate(host, imgDrive, cache); }
@@ -403,6 +471,7 @@ int runWindowsAgent(const std::filesystem::path& imgDrive,
             if (!accepted) {
                break;
             }
+            bool shutdownAccepted = false;
             try {
                verifyPeer(pipe.get(), endpoint, true);
                std::vector<std::string> arguments;
@@ -414,19 +483,25 @@ int runWindowsAgent(const std::filesystem::path& imgDrive,
                   reply.exitCode = 2;
                   reply.diagnostics = problem.what();
                }
+               shutdownAccepted = agent.isStopping();
                logMessage(cache, reply.diagnostics);
-               send(pipe.get(), encodeAgentReply(reply), 10000, stop.get());
-               if (receive(pipe.get(), 10000, stop.get()) != "FlacCD ack 1") {
+               const auto replyTimeout = shutdownAccepted ? 2000u : 10000u;
+               const auto cancel = shutdownAccepted ? nullptr : stop.get();
+               send(pipe.get(), encodeAgentReply(reply), replyTimeout, cancel);
+               if (receive(pipe.get(), replyTimeout, cancel) != "FlacCD ack 1") {
                   throw std::runtime_error("invalid IPC reply acknowledgment");
-               }
-               if (!arguments.empty() && arguments[0] == "agent-stop" && reply.exitCode == 0) {
-                  SetEvent(stop.get());
-                  PostMessageW(window, WM_CLOSE, 0, 0);
                }
             } catch (const std::exception& problem) {
                logMessage(cache, problem.what());
             }
             DisconnectNamedPipe(pipe.get());
+            if (shutdownAccepted || WaitForSingleObject(stop.get(), 0) == WAIT_OBJECT_0) {
+               // The reply is best-effort: a client crash/lost ACK cannot veto
+               // accepted shutdown. Never reconcile or delete resources here.
+               SetEvent(stop.get());
+               PostMessageW(window, WM_CLOSE, 0, 0);
+               break;
+            }
             // Reconcile even under sustained client traffic, not only during
             // idle waits. The coordinator enforces the five-second debounce.
             logMessage(cache, agent.reconcile());

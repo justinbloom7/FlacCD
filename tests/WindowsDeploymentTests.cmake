@@ -25,7 +25,7 @@ function(makeObject name symbol called bits)
 endfunction()
 
 function(writeConfiguration)
-   file(WRITE "${configFile}" "set(peObjdump [==[${peObjdump}]==])\nset(deployExecutables [==[${executables}]==])\nset(runtimeDirs [==[${directories}]==])\nset(deployBase [==[${deployBase}]==])\nset(archiveName FlacCD-test.zip)\nset(expectStaticRuntime TRUE)\nset(expectStaticPthread FALSE)\nset(sourceRoot [==[${sourceRoot}]==])\n")
+   file(WRITE "${configFile}" "set(peObjdump [==[${peObjdump}]==])\nset(deployExecutables [==[${executables}]==])\nset(runtimeDirs [==[${directories}]==])\nset(deployBase [==[${deployBase}]==])\nset(archiveName FlacCD-test.zip)\nset(expectStaticRuntime TRUE)\nset(expectStaticPthread FALSE)\nset(expectStaticFlac ${expectStaticFlac})\nset(sourceRoot [==[${sourceRoot}]==])\n")
 endfunction()
 
 function(deploy mode expected)
@@ -49,6 +49,7 @@ set(runtime "${root}/runtime")
 set(configFile "${root}/DeployConfig.cmake")
 set(deployBase "${root}/output")
 set(directories "${runtime}")
+set(expectStaticFlac FALSE)
 makeObject(system GetTickCount64 "" 64)
 run("${linker}" -mi386pep --dll --entry GetTickCount64 --export-all-symbols
     --out-implib "${root}/kernel.a" -o "${root}/system/KERNEL32.dll" "${root}/system.o")
@@ -100,6 +101,11 @@ if(NOT report MATCHES "system: kernel32.dll" OR NOT report MATCHES "bundled: lib
    message(FATAL_ERROR "Recursive import report incomplete")
 endif()
 file(SHA256 "${output}/flaccd.exe" originalHash)
+set(expectStaticFlac TRUE)
+writeConfiguration()
+deploy("" "Static FLAC policy not satisfied")
+set(expectStaticFlac FALSE)
+writeConfiguration()
 # A transitive omission cannot be masked by the source dependency directory.
 file(REMOVE "${output}/libgcc_s_seh-1.dll")
 deploy(verify "Unresolved non-system DLL libgcc_s_seh-1.dll")

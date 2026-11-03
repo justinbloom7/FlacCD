@@ -19,6 +19,7 @@ cmake --build build-windows
 ctest --test-dir build-windows --output-on-failure
 cmake --build build-windows --target flaccd-package
 cmake --build build-windows --target flaccd-audit
+cmake --build build-windows --target flaccd-smoke
 ```
 
 This produces:
@@ -58,18 +59,51 @@ For MinGW, options are target-local and apply to every end-user executable:
   linking is disabled, static winpthreads is not attempted, avoiding inconsistent
   thread runtimes between a shared libstdc++ and the application.
 
-The existing pkg-config selection of libFLAC is preserved. Prebuilt libFLAC may
-remain a DLL and may itself import Ogg, GCC or winpthreads DLLs, even when FlacCD
-statically links those runtimes. Packaging follows those transitive imports and
-bundles whatever is actually required. It does not assume a fixed list of DLLs,
-force every dependency static, or claim the application needs no adjacent DLLs.
+MinGW now defaults to `FLACCD_PREFER_STATIC_FLAC=ON`. Discovery reads the target
+pkg-config metadata, selects **`libFLAC.a`**, and never treats `libFLAC.dll.a` as
+a static implementation. The latter is an import library and still requires
+`libFLAC.dll`, regardless of `-static-libgcc`/`-static-libstdc++`.
 
-`RuntimePolicy.txt` records the requested/selected static policy.
+The selected archive and headers come from the target pkg-config directories
+(e.g. the same UCRT64 prefix). Its imported CMake target carries `FLAC__NO_DLL`
+and private dependencies from `pkg-config --static`, preferring real Ogg/thread
+archives where available. A compiler/linker probe references decoder, encoder and
+metadata APIs, checking header usage, architecture/link compatibility and private
+symbols with the selected toolchain. On Windows the probe PE imports are also
+checked to reject a disguised import archive. The target binary is never run by
+configuration, so MinGW cross-compilation remains supported.
+
+Configure prints `FLAC: verified static archive ...` only after the probe passes.
+Otherwise it reports shared fallback and leaves a diagnostic log in
+`CMakeFiles/FlacCDFlacProbe.log`. `FLACCD_PREFER_STATIC_FLAC=OFF` explicitly chooses
+the existing pkg-config shared selection. An optional
+`FLACCD_STATIC_FLAC_ARCHIVE=/actual/compatible/libFLAC.a` override still must pass
+the probe; use an archive built for the same target CRT/toolchain/header package,
+not a differently named import library or an unrelated MinGW installation.
+
+If static FLAC is unavailable/impractical, the deployment target bundles
+`libFLAC.dll` and all non-system imports recursively. Static FLAC can also have
+shared private dependencies; the final import audit, not archive names or a
+successful build alone, determines which DLLs must be shipped. Native Linux keeps
+its existing pkg-config linkage. No decoder, parser or mount behavior is changed.
+
+`RuntimePolicy.txt` records the selected FLAC linkage/archive and runtime policy.
 `RuntimeDependencies.txt` records the **actual** graph, PE format and SHA256 for
 every executable and bundled DLL. `RuntimeOrigins.txt` records where bundled
 DLLs came from. `imports/*.imports.txt` contains raw `objdump -p` output for every
 staged binary; `source-imports/` retains the initial source inspection. These
 reports distinguish OS-supplied imports from bundled non-system dependencies.
+
+After packaging, show the actual selected policy and final dependency graph:
+
+```bat
+type build-windows\deploy\Release\FlacCD\RuntimePolicy.txt
+type build-windows\deploy\Release\FlacCD\RuntimeDependencies.txt
+```
+
+A `static` FLAC policy is enforced by the final graph audit: any remaining
+`libFLAC*.dll` import fails deployment. In shared fallback, the graph must resolve
+and bundle that DLL and all of its non-system dependencies before publication.
 
 Expected categories, **not a verified import list for your build**:
 
@@ -78,7 +112,8 @@ Expected categories, **not a verified import list for your build**:
 | GCC unwinder (`libgcc_s_*.dll`) | Static in FlacCD by default; may still be needed by a third-party DLL |
 | C++ library (`libstdc++-6.dll`) | Static in FlacCD by default; any third-party import is bundled |
 | `libwinpthread-1.dll` | Static when the archive/probe supports it; otherwise bundled if imported |
-| `libFLAC*.dll`, `libogg*.dll` | Bundle selected shared-library imports and their dependencies |
+| `libFLAC*.dll` | Absent when static selection/probe succeeds; otherwise bundled with its dependencies |
+| `libogg*.dll` | Static when a compatible private archive is selected; otherwise bundled if imported |
 | `KERNEL32.dll`, `ADVAPI32.dll`, `USER32.dll`, `SHELL32.dll`, `OLE32.dll`, `SETUPAPI.dll`, `CFGMGR32.dll`, etc. | Windows system DLLs; not bundled |
 | `ucrtbase.dll`, Windows CRT API-set contracts | Supplied by Windows 10/11; not bundled |
 | `msys-2.0.dll`, `cygwin1.dll` | Rejected: indicates an unintended POSIX-emulation build/dependency |
@@ -160,7 +195,42 @@ For MSVC builds, MinGW link flags are not applied. The PE deployment targets sti
 require GNU objdump and explicitly configured redistributable DLL directories;
 MSVC redistributable selection/licensing remains the distributor's responsibility.
 
+## Graceful stop before rebuilding
+
+Stop the agent that is using the old executable **before** building/linking it:
+
+```bat
+flaccd agent stop
+flaccd agent stop --timeout 120
+cmake --build build-windows
+```
+
+The first successful command waits for complete process exit and release of the
+image file. Repeating it while no agent exists is a successful no-op; it does
+not need ImgDrive discovery or start a new process. Stop does not unmount discs,
+delete their CUE/audio files, or discard ownership records. Monitoring pauses;
+restart with `flaccd status` and saved mounts/ejects are reconciled.
+
+For the **first upgrade from a binary that lacks the new syntax**, run the old
+`flaccd agent-stop` from your existing working UCRT64 shell before rebuilding.
+The alias remains supported in the new CLI. Do not solve a locked executable by
+changing global PATH or making forced termination the normal build workflow.
+
+If shutdown times out, the command returns nonzero and reports the process ID
+when known. It does not force-kill the agent. Finish/wait for ongoing work and
+retry with a longer timeout; do not assume the executable is unlocked after an
+error. See [WindowsAgentTesting.md](WindowsAgentTesting.md) for lifecycle tests.
+
 ## Verify from normal cmd.exe and PowerShell
+
+The native `flaccd-smoke` target (also registered as `windows-deployment-smoke`
+in native MinGW CTest) first builds/audits the isolated folder, then starts all
+five executables under system CMD and PowerShell with development directories
+removed from their **process-only** PATHs. Four utilities use `--help`; the agent
+gets intentionally invalid startup arguments and must return its expected error
+without starting a server. It needs no mounted disc/ImgDrive operation and does
+not alter script-execution policy. Logs are written to `deploy/Release/Smoke/`.
+Cross builds can package/audit on Linux, but runtime smoke tests require Windows.
 
 Do not claim the binaries are standalone based on successful linking or an MSYS2
 shell run. The strongest test is a clean Windows 10/11 VM without MSYS2, MinGW or
@@ -203,7 +273,7 @@ Get-CimInstance Win32_Process -Filter "Name='flaccd-agent.exe'" |
 Get-Process flaccd-agent | ForEach-Object {
   $_.Modules | Select-Object ModuleName,FileName
 }
-.\flaccd.exe agent-stop
+.\flaccd.exe agent stop
 ```
 
 Check that the agent is the packaged executable and every non-system loaded DLL
@@ -225,8 +295,14 @@ static-policy violations, prior-output preservation, ownership and ZIP creation.
 It does not execute those fixtures or prove actual MinGW runtime link selection.
 The fixture test is registered when suitable host GNU binutils are available.
 
+The static-FLAC CMake tests use native stub archives with a mandatory private
+Ogg-like symbol and `FLAC__NO_DLL` header check. They cover selected static
+linkage, missing/incompatible archives, missing private dependencies, explicit
+shared selection, and rejection of a `.dll.a` override. They do not prove real
+UCRT64 libFLAC ABI/decoding behavior; run the normal audio/metadata tests there.
+
 No MinGW compiler or actual Windows FlacCD binaries were available here. The
-actual final FlacCD PE import tables, static winpthreads probe, cmd.exe/PowerShell
+actual final FlacCD PE import tables, real static FLAC/winpthreads probes, cmd.exe/PowerShell
 startup, loaded-module paths and clean-Windows behavior therefore remain
 **unverified until the commands above are run with the Windows build**. The
 package reports will supply the exact remaining DLL list for that build.

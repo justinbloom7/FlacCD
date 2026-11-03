@@ -21,7 +21,9 @@ For Windows delivery without MSYS2/MinGW installed on the destination machine,
 configure a Release build and run `cmake --build build-windows --target flaccd-package`.
 The audited folder/ZIP contains all five applications and any required non-system
 DLLs. MinGW GCC/C++ runtimes are static by default; winpthreads is static when a
-link probe supports it. Shared libFLAC dependencies are collected recursively.
+link probe supports it. MinGW builds prefer a verified real `libFLAC.a` (with
+private dependencies and `FLAC__NO_DLL`); unavailable/incompatible archives fall
+back to bundled libFLAC and its recursive DLL dependencies.
 See [WindowsDeployment.md](docs/WindowsDeployment.md) for build/package commands,
 import reports, cross-compilation and clean cmd.exe/PowerShell verification.
 
@@ -386,7 +388,7 @@ inspection, decoding and export tools remain independent.
 .\build-windows\flaccd.exe mount "Y:\temp\music\Zelda.flac" --drive auto --no-copy
 .\build-windows\flaccd.exe status
 .\build-windows\flaccd.exe unmount E:
-.\build-windows\flaccd.exe agent-stop
+.\build-windows\flaccd.exe agent stop
 ```
 
 Supply your actual FLAC path and actual ImgDrive drive letter. `--drive` may be
@@ -433,8 +435,13 @@ All commands accept `--imgdrive PATH.exe`, `--cache-dir DIR`, and
 configuration, `FLACCD_IMGDRIVE`, App Paths, and absolute PATH directories.
 `--layout native|text|auto` and `--no-copy` apply to mount. Auto layout reports
 conflicting embedded layouts. A running agent has one executable/cache
-configuration; use `agent-stop` before changing it. Agent-stop retains mounts;
-the next CLI command starts a new agent and reconciles completed records.
+configuration; use `flaccd agent stop` before changing it. The command never
+starts an absent agent and reports success only after confirmed exit (or when
+not running). `--timeout SECONDS` bounds queueing/shutdown; the default is 30.
+In-progress work may finish, but accepted shutdown rejects new work, preserves
+active mounts/state and suspends eject monitoring. The next CLI command starts
+a new agent and reconciles saved records, including discs ejected while stopped.
+The legacy `agent-stop` spelling remains an alias.
 
 The default cache is `%LOCALAPPDATA%\FlacCD\ImgDrive\v1`. Immutable ownership
 intents, resource identities and phase/device records survive CLI/agent exit.

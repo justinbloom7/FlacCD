@@ -1,4 +1,5 @@
 #include "flaccd/mount/MountAgent.h"
+#include "flaccd/mount/AgentCommand.h"
 #include "flaccd/PathText.h"
 
 #include <charconv>
@@ -34,10 +35,26 @@ MountAgent::MountAgent(ProcessRunner& processHost, std::filesystem::path imageEx
    : host(processHost), executable(std::move(imageExecutable)), cache(std::move(mountCache)) {
 }
 
-AgentReply MountAgent::handle(const std::vector<std::string>& arguments) {
-   std::lock_guard guard(mutex);
+AgentReply MountAgent::handle(const std::vector<std::string>& request) {
    AgentReply reply;
    try {
+      const auto arguments = normalizeAgentCommand(request);
+      const auto stopTimeout = agentStopTimeout(arguments);
+      if (stopTimeout) {
+         // Announce before waiting for the operation lock: in-flight work may
+         // finish, but queued mount requests must not begin after this point.
+         stopping.store(true);
+      }
+      std::lock_guard guard(mutex);
+      if (stopTimeout) {
+         reply.output = "Agent shutdown requested; mounts/state retained; eject monitoring will pause.\n";
+         return reply;
+      }
+      if (stopping.load()) {
+         reply.exitCode = 1;
+         reply.diagnostics = "Agent is stopping; no new operations accepted.\n";
+         return reply;
+      }
       if (arguments.empty()) {
          throw std::invalid_argument("missing command");
       }
@@ -97,15 +114,11 @@ AgentReply MountAgent::handle(const std::vector<std::string>& arguments) {
          } else if (option == "--cache-dir" || option == "--imgdrive") {
             const auto expected = option == "--cache-dir" ? cache : executable;
             if (std::filesystem::weakly_canonical(pathFromUtf8(value)) != std::filesystem::weakly_canonical(expected)) {
-               throw std::invalid_argument("agent configuration differs; run flaccd agent-stop, then retry with the desired options");
+               throw std::invalid_argument("agent configuration differs; run flaccd agent stop, then retry with the desired options");
             }
          } else {
             throw std::invalid_argument("unknown/inapplicable option " + option);
          }
-      }
-      if (command == "agent-stop") {
-         reply.output = "Agent stopping; mount resources retained for recovery.\n";
-         return reply;
       }
       ImgDriveBackend backend(host, executable, cache, timeout, nullptr, [&](const std::string& text) {
          if (reply.diagnostics.size() < 65536) {
@@ -148,9 +161,16 @@ AgentReply MountAgent::handle(const std::vector<std::string>& arguments) {
    return reply;
 }
 
+bool MountAgent::isStopping() const noexcept {
+   return stopping.load();
+}
+
 std::string MountAgent::reconcile(std::chrono::steady_clock::time_point now) {
    std::lock_guard guard(mutex);
    std::string result;
+   if (stopping.load()) {
+      return result;
+   }
    try {
       ImgDriveBackend backend(host, executable, cache);
       std::set<std::string> active;

@@ -12,7 +12,7 @@ function(configureWindowsDeployment)
    set(runtimeDirs ${FLACCD_WINDOWS_RUNTIME_DIRS})
    get_filename_component(compilerDirectory "${CMAKE_CXX_COMPILER}" DIRECTORY)
    list(APPEND runtimeDirs "${compilerDirectory}")
-   foreach(libraryDirectory IN LISTS FLAC_LIBRARY_DIRS)
+   foreach(libraryDirectory IN LISTS FLAC_LIBRARY_DIRS FLAC_STATIC_LIBRARY_DIRS)
       get_filename_component(prefix "${libraryDirectory}" DIRECTORY)
       list(APPEND runtimeDirs "${libraryDirectory}" "${prefix}/bin")
    endforeach()
@@ -113,6 +113,10 @@ function(configureWindowsDeployment)
    if(staticPthreadArchive)
       set(expectStaticPthread TRUE)
    endif()
+   set(expectStaticFlac FALSE)
+   if(flacLinkage STREQUAL "static")
+      set(expectStaticFlac TRUE)
+   endif()
    set(configuration "$<IF:$<BOOL:$<CONFIG>>,$<CONFIG>,Default>")
    set(deployBase "${CMAKE_BINARY_DIR}/deploy/${configuration}")
    math(EXPR architectureBits "${CMAKE_SIZEOF_VOID_P} * 8")
@@ -131,6 +135,12 @@ function(configureWindowsDeployment)
       COMMAND "${CMAKE_COMMAND}" "-DconfigFile=${configFile}" -DdeployMode=verify
               -P "${PROJECT_SOURCE_DIR}/cmake/DeployWindows.cmake"
       COMMENT "Audit existing deployment using only its adjacent DLLs, never developer PATH"
+      VERBATIM)
+   add_custom_target(flaccd-smoke
+      COMMAND "${CMAKE_COMMAND}" "-DconfigFile=${configFile}"
+              -P "${PROJECT_SOURCE_DIR}/cmake/CheckWindowsDeployment.cmake"
+      DEPENDS flaccd-deploy
+      COMMENT "Verify packaged startup in normal CMD and PowerShell with a clean process PATH"
       VERBATIM)
    add_custom_target(flaccd-package
       COMMAND "${CMAKE_COMMAND}" "-DconfigFile=${configFile}" -DdeployMode=package

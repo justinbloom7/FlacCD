@@ -38,7 +38,7 @@ Use the existing MSYS2 **UCRT64** shell and dependencies:
 cmake -S . -B build-windows -G Ninja
 cmake --build build-windows
 ctest --test-dir build-windows --output-on-failure
-ctest --test-dir build-windows -R '^(windows-process|windows-agent-ipc)$' -V
+ctest --test-dir build-windows -R '^(windows-process|windows-agent-ipc|windows-deployment-smoke)$' -V
 ```
 
 For delivery outside MSYS2, use the audited folder/ZIP from `flaccd-package`;
@@ -51,7 +51,11 @@ changes are needed. Never run these tests as administrator to mask access errors
 coverage. `windows-agent-ipc` uses a separate current-user test endpoint and its
 own process as an agent helper. It tests startup, concurrent clients, duplicate
 instance rejection, structured errors, status/drives, refusal of unmanaged
-unmount, stop and restart without mounting any real ImgDrive image. Its mock
+unmount, and stop/restart without mounting any real ImgDrive image. Its CLI probe
+uses the same production client code on the private endpoint: it checks absent
+and repeated `agent stop`, the legacy alias, complete process exit, exclusive
+write access to the former agent image, and a delayed-exit timeout without killing
+that helper. Its mock
 executable is never invoked. A small isolated temporary test cache is retained
 for diagnostics; it never deletes a live production agent's resources.
 
@@ -126,7 +130,7 @@ empty ImgDrive device such as E: or `--drive auto`.
 8. Repeat with spaces/Unicode in both source and cache paths. Run two CLI clients
    concurrently on separate empty ImgDrive drives; unmount/eject one and confirm
    the other still works. Managed CUEs must not be shared between mounts.
-9. Stop/restart the agent while mounted with `agent-stop`, followed by `status`.
+9. Stop/restart the agent while mounted with `agent stop`, followed by `status`.
    Mount resources must survive. Eject during the stopped interval; on restart,
    two confirmed empty observations should reconcile the missed event. Also
    test reboot recovery if ImgDrive restores mounts; do not delete resources
@@ -142,6 +146,64 @@ empty ImgDrive device such as E: or `--drive auto`.
     unrelated letter must not trigger an unmount. Do not deliberately occupy or
     manipulate another application's drive to force this test.
 12. Repeat on Windows 11 before claiming that platform was tested.
+
+## Graceful shutdown and rebuilding
+
+```powershell
+.\build-windows\flaccd.exe agent stop
+.\build-windows\flaccd.exe agent stop --timeout 120
+```
+
+The public command normalizes to the existing `agent-stop` IPC request; that old
+CLI spelling remains a supported alias. Stop uses the existing secured named
+pipe. It never starts an absent agent and does not discover/require ImgDrive,
+its install path, or the configured cache. Legacy `--imgdrive`/`--cache-dir`
+arguments are accepted but do not change which per-user agent is stopped.
+
+The default **total** stop timeout is 30 seconds (1..600 configurable), covering
+queueing and process exit. The current serialized operation may finish first;
+there is no unsafe cancellation of an export/copy or state write. Accepted stop
+announces the stopping state, rejects new/queued mount work, suppresses further
+reconciliation, closes the pipe/window worker, joins it and exits. A dropped
+reply/ACK cannot veto accepted shutdown. Queued normal clients do not silently
+restart the exiting agent; retry them explicitly after shutdown.
+
+The client retains a verified process handle before sending stop and returns
+success only after that process exits, or if no agent instance exists. An absent
+or repeated stop is a successful no-op. A timeout returns nonzero, reports the
+process ID when known, and preserves state. There is no forced process kill.
+Do not assume an image is writable after a failed stop. The native test includes
+a helper that deliberately delays process exit to verify this failure path.
+
+Mounted audio, generated adjacent CUEs, staged links/copies and ownership records
+survive shutdown. Existing user CUEs and original FLACs are untouched. Monitoring
+is paused until the next `status`, mount or manually started agent; restart then
+reconciles records against actual devices using the existing empty-media debounce.
+
+Manual Windows checks:
+
+1. Run `agent stop` twice with no agent. Expect success and no newly started
+   process/cache. Try without an ImgDrive executable configured as well.
+2. Mount a test album; note PID, CUE/staged paths and hashes. Stop the agent.
+   Confirm Task Manager/process inspection shows the **old PID exited**, audio
+   remains mounted, and every mount resource/state record is retained unchanged.
+3. Rebuild `flaccd-agent.exe` immediately after successful stop. It must no longer
+   be locked. Use the old `agent-stop` spelling in the working UCRT64 shell for
+   the first upgrade if the previous CLI cannot recognize `agent stop` yet.
+4. Eject the mounted disc while the agent is stopped. Confirm no cleanup occurs
+   then. Start it with `flaccd status`; after two confirmed empty observations,
+   generated resources should be removed and user CUEs retained.
+5. Test stop during a long preparation/mount. Work may finish safely first;
+   increase `--timeout` if needed. Once stop is accepted, new mounts must be
+   refused, and no mount state may be discarded.
+6. Use the packaged executables from normal CMD/PowerShell without MSYS2 paths;
+   see [WindowsDeployment.md](WindowsDeployment.md). Record the selected FLAC
+   linkage and actual direct/transitive DLL report, not just a successful link.
+
+These native process/lock and installed-ImgDrive checks have not run in the Linux
+session. Portable mock tests cover in-flight completion, queued-work rejection,
+all CUE/audio ownership strategies, stop preservation and stopped-period eject
+reconciliation after a fresh coordinator starts.
 
 ## Agent lifecycle, IPC and limitations
 
@@ -170,11 +232,11 @@ Concurrent clients queue behind serialized operations. Client startup has a
 reads/writes are bounded, replies allow lengthy mount operations, and a submitted
 request is never replayed on disconnect. A timed-out client must inspect status:
 the agent may have completed its operation. Mount/process/verification timeouts
-retain resources. Stopping the agent does not unmount media. After acknowledgment,
-the stop client waits briefly for process exit before returning.
+retain resources. Stopping the agent does not unmount media. For stop, the client waits on the verified process handle until its total
+shutdown deadline; a timeout is an error, not a warning attached to success.
 
 `--imgdrive`/`--cache-dir` configure the agent at startup; a running agent refuses
-conflicting configuration and suggests `agent-stop`. The agent persists until
+conflicting configuration and suggests `agent stop`. The agent persists until
 stop/logout. There is no automatic logon task/registry entry: start any CLI
 command after login (or manually start `flaccd-agent.exe`) to recover records.
 Changing configuration while mounts remain in another cache does not migrate or
@@ -219,12 +281,15 @@ Relevant primary references:
   inventory, driver ancestry, device binding and TOC diagnostics.
 - `ImgDriveBackend.h/.cpp`, `MountStateStore.h/.cpp`: requested/actual mapping,
   immutable device sidecars, strict selection, safe eject cleanup and messages.
-- `AgentProtocol.h/.cpp`, `MountAgent.h/.cpp`: portable framing, typed status rows,
-  serialized commands and reconciliation policy.
+- `AgentProtocol.h/.cpp`, `AgentCommand.h/.cpp`, `MountAgent.h/.cpp`: portable
+  framing/command normalization, typed status rows, lifecycle and reconciliation.
+- `WindowsAgentClient.h/.cpp`: shared production CLI client with isolated test settings.
 - `WindowsAgentIpc.h/.cpp`, `FlaccdAgent.cpp`, `Flaccd.cpp`: restricted named pipes,
   single-instance agent, hidden notification window, startup and CLI client.
-- `ImgDriveBackendTests.cpp`, `WindowsAgentTests.cpp`, `CMakeLists.txt`: portable
-  regressions and conditional native IPC tests/targets.
+- `ImgDriveBackendTests.cpp`, `WindowsAgentTests.cpp`, `WindowsAgentCliProbe.cpp`,
+  `CMakeLists.txt`: portable regressions and conditional native CLI/IPC tests.
+- `FlacDependency.cmake`, `StaticFlacTests.cmake`: verified static FLAC selection,
+  private CMake dependencies, `FLAC__NO_DLL`, and shared fallback tests.
 - `README.md`, this guide: current architecture, CLI and qualification limits.
 
 Existing metadata/layout parsing, decoding, export tools, Windows process quoting

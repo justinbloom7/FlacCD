@@ -7,6 +7,8 @@ endif()
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FLAC REQUIRED IMPORTED_TARGET flac>=1.3.3)
+include(cmake/FlacDependency.cmake)
+configureFlacDependency()
 
 # Keep one C++ runtime per application on Windows; do not split the core's
 # exception/allocator ABI across DLLs with independent static GCC runtimes.
@@ -19,7 +21,7 @@ add_library(flaccd-core ${flaccdLibraryType} src/FlacMetadataInspector.cpp src/C
 target_include_directories(flaccd-core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_compile_features(flaccd-core PUBLIC cxx_std_20)
 set_target_properties(flaccd-core PROPERTIES CXX_EXTENSIONS OFF)
-target_link_libraries(flaccd-core PRIVATE PkgConfig::FLAC)
+target_link_libraries(flaccd-core PRIVATE flaccd::flac)
 
 add_executable(flaccd-info apps/FlaccdInfo.cpp)
 target_link_libraries(flaccd-info PRIVATE flaccd-core)
@@ -41,6 +43,7 @@ if(WIN32 OR BUILD_TESTING)
    add_library(flaccd-mount ${flaccdLibraryType} src/mount/ImgDriveBackend.cpp
                             src/mount/OpticalDrive.cpp
                             src/mount/AgentProtocol.cpp
+                            src/mount/AgentCommand.cpp
                             src/mount/MountAgent.cpp
                             src/mount/MountStateStore.cpp
                             src/mount/MountFileSystem.cpp
@@ -51,7 +54,7 @@ endif()
 
 if(WIN32)
    target_compile_definitions(flaccd-mount PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
-   add_library(flaccd-imgdrive ${flaccdLibraryType} src/mount/WindowsImgDriveHost.cpp src/mount/WindowsAgentIpc.cpp)
+   add_library(flaccd-imgdrive ${flaccdLibraryType} src/mount/WindowsImgDriveHost.cpp src/mount/WindowsAgentIpc.cpp src/mount/WindowsAgentClient.cpp)
    target_link_libraries(flaccd-imgdrive PUBLIC flaccd-mount PRIVATE advapi32 shell32 ole32 user32 uuid setupapi cfgmgr32)
    target_compile_definitions(flaccd-imgdrive PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
    set_target_properties(flaccd-imgdrive PROPERTIES CXX_EXTENSIONS OFF)
@@ -82,6 +85,14 @@ if(WIN32)
 endif()
 
 if(BUILD_TESTING)
+   if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+      add_test(NAME static-flac-selection COMMAND "${CMAKE_COMMAND}"
+         "-DsourceRoot=${CMAKE_CURRENT_SOURCE_DIR}"
+         "-DtestDirectory=${CMAKE_CURRENT_BINARY_DIR}/dependency-fixtures"
+         "-DcompilerPath=${CMAKE_CXX_COMPILER}"
+         "-DfixtureGenerator=${CMAKE_GENERATOR}"
+         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/StaticFlacTests.cmake")
+   endif()
    # Host binutils can build tiny real PE fixtures without Windows headers,
    # MinGW runtimes, or executing target code (also useful on native Linux).
    get_filename_component(toolDirectory "${CMAKE_CXX_COMPILER}" DIRECTORY)
@@ -137,8 +148,24 @@ if(BUILD_TESTING)
       if(MSVC)
          target_compile_options(flaccd-windows-agent-tests PRIVATE /utf-8)
       endif()
-      add_test(NAME windows-agent-ipc COMMAND flaccd-windows-agent-tests)
+      add_executable(flaccd-agent-cli-probe tests/WindowsAgentCliProbe.cpp)
+      target_link_libraries(flaccd-agent-cli-probe PRIVATE flaccd-imgdrive)
+      set_target_properties(flaccd-agent-cli-probe PROPERTIES CXX_EXTENSIONS OFF)
+      if(MINGW)
+         target_link_options(flaccd-agent-cli-probe PRIVATE -municode)
+      endif()
+      if(MSVC)
+         target_compile_options(flaccd-agent-cli-probe PRIVATE /utf-8)
+      endif()
+      add_test(NAME windows-agent-ipc COMMAND flaccd-windows-agent-tests "$<TARGET_FILE:flaccd-agent-cli-probe>")
       set_tests_properties(windows-agent-ipc PROPERTIES TIMEOUT 90)
+      if(MINGW AND NOT CMAKE_CROSSCOMPILING)
+         add_test(NAME windows-deployment-smoke COMMAND "${CMAKE_COMMAND}"
+            "-DbuildRoot=${CMAKE_BINARY_DIR}"
+            "-Dconfiguration=$<CONFIG>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckWindowsDeployment.cmake")
+         set_tests_properties(windows-deployment-smoke PROPERTIES TIMEOUT 120)
+      endif()
    endif()
    find_package(Threads REQUIRED)
    add_executable(flaccd-imgdrive-tests tests/ImgDriveBackendTests.cpp)
@@ -166,7 +193,7 @@ if(BUILD_TESTING)
       -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/BinCueCliTests.cmake")
    set_tests_properties(bin-cue-cli PROPERTIES FIXTURES_REQUIRED cddaFixtures)
    add_executable(flaccd-cdda-tests tests/CddaSectorReaderTests.cpp)
-   target_link_libraries(flaccd-cdda-tests PRIVATE flaccd-core PkgConfig::FLAC)
+   target_link_libraries(flaccd-cdda-tests PRIVATE flaccd-core flaccd::flac)
    set_target_properties(flaccd-cdda-tests PROPERTIES CXX_EXTENSIONS OFF)
    add_test(NAME cdda-reader COMMAND flaccd-cdda-tests "${CMAKE_CURRENT_BINARY_DIR}/cdda-fixtures")
    set_tests_properties(cdda-reader PROPERTIES FIXTURES_SETUP cddaFixtures)

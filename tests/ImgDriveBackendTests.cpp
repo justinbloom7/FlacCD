@@ -1,11 +1,13 @@
 #include "flaccd/mount/ImgDriveBackend.h"
 #include "flaccd/mount/MountAgent.h"
+#include "flaccd/mount/AgentCommand.h"
 #include "flaccd/CueSheetWriter.h"
 #include "flaccd/PathText.h"
 
 #include <algorithm>
 #include <array>
 #include <fstream>
+#include <future>
 #include <iomanip>
 #include <iostream>
 #include <iterator>
@@ -148,6 +150,9 @@ public:
                  "ImgDrive requires matching basenames and same directory");
          require(std::filesystem::equivalent(audio, found->audioPath), "wrong audio resource");
          require(readFile(audio).starts_with("fLaC"), "mock mounter cannot read FLAC");
+         if (onMount) {
+            onMount();
+         }
          pendingCue = cue;
          pendingDrive = redirectDrive ? redirectDrive : found->drive;
       }
@@ -193,6 +198,7 @@ public:
    std::filesystem::path cache;
    std::recursive_mutex mutex;
    flaccd::ProcessResult result;
+   std::function<void()> onMount;
    char redirectDrive = 0;
    std::string identitySuffix;
    std::set<char> physical;
@@ -716,6 +722,89 @@ void testAgent(const std::filesystem::path& fixtures) {
    s.unchanged();
 }
 
+void testAgentStop(const std::filesystem::path& fixtures) {
+   for (int variant = 0; variant < 4; ++variant) {
+      Scenario s(fixtures);
+      if (variant == 1) {
+         writeFile(s.files.adjacent, s.cue());
+      } else if (variant >= 2) {
+         s.files.denyAdjacent = true;
+         if (variant == 3) {
+            s.files.linkError = std::make_error_code(std::errc::cross_device_link);
+         }
+      }
+      auto backend = s.backend();
+      const auto record = backend->mount(s.source, 'D');
+      const auto cueBytes = readFile(record.cuePath);
+      const auto manifest = readFile(record.entryPath / "mount.state");
+      backend.reset();
+      const auto calls = s.host.calls.size();
+      auto agent = std::make_unique<flaccd::MountAgent>(s.host, s.executable, s.host.cache);
+      require(ipc(*agent, {"agent", "stop", "--timeout", "0"}).exitCode == 2 && !agent->isStopping(),
+              "invalid stop changed agent lifecycle");
+      const auto reply = ipc(*agent, {"agent", "stop"});
+      require(reply.exitCode == 0 && agent->isStopping(), "agent stop was not accepted");
+      require(ipc(*agent, {"agent-stop"}).exitCode == 0, "repeated legacy stop failed");
+      require(ipc(*agent, {"mount", flaccd::pathToUtf8(s.source), "--drive", "E:"}).exitCode == 1,
+              "stopping agent accepted a new mount");
+      require(readFile(record.cuePath) == cueBytes && readFile(record.entryPath / "mount.state") == manifest &&
+              readFile(record.audioPath) == s.original && s.host.calls.size() == calls,
+              "shutdown unmounted or changed owned mount resources");
+      const auto now = std::chrono::steady_clock::now();
+      s.host.media['D'] = flaccd::MediaState::Empty; // Eject while monitoring is stopped.
+      agent->reconcile(now);
+      agent->reconcile(now + std::chrono::seconds(10));
+      require(std::filesystem::exists(record.cuePath) && std::filesystem::exists(record.entryPath),
+              "stopping agent reconciled/deleted resources");
+      agent.reset();
+      agent = std::make_unique<flaccd::MountAgent>(s.host, s.executable, s.host.cache);
+      agent->reconcile(now + std::chrono::seconds(20));
+      agent->reconcile(now + std::chrono::seconds(26));
+      require(ipc(*agent, {"status"}).records.empty(), "restart did not recover eject while stopped");
+      require(variant == 1 ? readFile(record.cuePath) == cueBytes : !std::filesystem::exists(record.cuePath),
+              "restart cleanup mishandled user/generated CUE");
+      s.unchanged();
+   }
+}
+
+void testStopInProgress(const std::filesystem::path& fixtures) {
+   Scenario s(fixtures);
+   flaccd::MountAgent agent(s.host, s.executable, s.host.cache);
+   std::promise<void> entered;
+   std::promise<void> release;
+   auto ready = entered.get_future();
+   auto proceed = release.get_future().share();
+   s.host.onMount = [&] { entered.set_value(); proceed.wait(); };
+   flaccd::AgentReply mounted;
+   flaccd::AgentReply stopped;
+   flaccd::AgentReply rejected;
+   std::thread mount([&] { mounted = ipc(agent, {"mount", flaccd::pathToUtf8(s.source), "--drive", "D:"}); });
+   if (ready.wait_for(std::chrono::seconds(2)) != std::future_status::ready) {
+      release.set_value();
+      mount.join();
+      require(false, "in-flight mount did not reach the mock decoder process");
+   }
+   std::thread stop([&] { stopped = ipc(agent, {"agent", "stop"}); });
+   const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+   while (!agent.isStopping() && std::chrono::steady_clock::now() < deadline) {
+      std::this_thread::sleep_for(std::chrono::milliseconds(1));
+   }
+   const bool announced = agent.isStopping();
+   std::thread queued([&] { rejected = ipc(agent, {"mount", flaccd::pathToUtf8(s.source), "--drive", "E:"}); });
+   release.set_value();
+   mount.join();
+   stop.join();
+   queued.join();
+   require(announced && mounted.exitCode == 0 && stopped.exitCode == 0 && rejected.exitCode == 1 &&
+           rejected.diagnostics.find("stopping") != std::string::npos && s.host.calls.size() == 1,
+           "shutdown failed to finish in-flight work/reject queued work");
+   require(std::filesystem::exists(s.files.adjacent) && s.host.media['D'] == flaccd::MediaState::Ready,
+           "in-flight shutdown discarded a mounted image");
+   s.host.onMount = {};
+   auto backend = s.backend();
+   backend->unmount('D');
+}
+
 void testAgentUncertain(const std::filesystem::path& fixtures) {
    for (int variant = 0; variant < 5; ++variant) {
       Scenario s(fixtures);
@@ -745,6 +834,14 @@ void testAgentUncertain(const std::filesystem::path& fixtures) {
 }
 
 void testProtocol() {
+   require(flaccd::normalizeAgentCommand({"agent", "stop"}) == std::vector<std::string>{"agent-stop"},
+           "agent stop normalization");
+   require(flaccd::agentStopTimeout({"agent-stop"}) == std::chrono::seconds(30), "default stop timeout");
+   require(flaccd::agentStopTimeout({"agent-stop", "--timeout", "2"}) == std::chrono::seconds(2), "explicit stop timeout");
+   expectError([&] { flaccd::normalizeAgentCommand({"agent"}); });
+   expectError([&] { flaccd::normalizeAgentCommand({"agent", "unknown"}); });
+   expectError([&] { flaccd::agentStopTimeout({"agent-stop", "--unknown", "1"}); });
+   expectError([&] { flaccd::agentStopTimeout({"agent-stop", "--timeout", "1", "--timeout", "2"}); });
    const std::vector<std::string> arguments{"mount", "Y:\\Music with spaces\\音楽 é.flac", "--no-copy"};
    const auto text = flaccd::encodeAgentRequest(arguments);
    require(flaccd::decodeAgentRequest(text) == arguments, "IPC lost Windows/Unicode arguments");
@@ -829,6 +926,8 @@ int main(int argumentCount, char* arguments[]) {
       testProtocol();
       testAgent(fixtures);
       testAgentUncertain(fixtures);
+      testAgentStop(fixtures);
+      testStopInProgress(fixtures);
       std::cout << "ImgDrive strategy, ownership, recovery, race, and filesystem-fallback tests passed\n";
    } catch (const std::exception& error) {
       std::cerr << error.what() << '\n';
