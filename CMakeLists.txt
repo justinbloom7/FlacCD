@@ -7,12 +7,21 @@ endif()
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FLAC REQUIRED IMPORTED_TARGET flac>=1.3.3)
+include(cmake/FlacDependency.cmake)
+configureFlacDependency()
 
-add_library(flaccd-core src/FlacMetadataInspector.cpp src/CueTextMetadata.cpp src/TrackLayout.cpp src/CddaSectorReader.cpp src/BinCueExporter.cpp src/CueSheetWriter.cpp src/AudioExporter.cpp src/ExportOutput.cpp)
+# Keep one C++ runtime per application on Windows; do not split the core's
+# exception/allocator ABI across DLLs with independent static GCC runtimes.
+set(flaccdLibraryType "")
+if(WIN32)
+   set(flaccdLibraryType STATIC)
+endif()
+
+add_library(flaccd-core ${flaccdLibraryType} src/FlacMetadataInspector.cpp src/CueTextMetadata.cpp src/TrackLayout.cpp src/CddaSectorReader.cpp src/BinCueExporter.cpp src/CueSheetWriter.cpp src/AudioExporter.cpp src/ExportOutput.cpp)
 target_include_directories(flaccd-core PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/include")
 target_compile_features(flaccd-core PUBLIC cxx_std_20)
 set_target_properties(flaccd-core PROPERTIES CXX_EXTENSIONS OFF)
-target_link_libraries(flaccd-core PRIVATE PkgConfig::FLAC)
+target_link_libraries(flaccd-core PRIVATE flaccd::flac)
 
 add_executable(flaccd-info apps/FlaccdInfo.cpp)
 target_link_libraries(flaccd-info PRIVATE flaccd-core)
@@ -31,19 +40,37 @@ include(CTest)
 # Mount coordination is platform-neutral for mock tests, separate from core.
 # The real process/device adapter and CLI are built only on Windows.
 if(WIN32 OR BUILD_TESTING)
-   add_library(flaccd-mount src/mount/ImgDriveBackend.cpp
+   add_library(flaccd-mount ${flaccdLibraryType} src/mount/ImgDriveBackend.cpp
+                            src/mount/OpticalDrive.cpp
+                            src/mount/AgentProtocol.cpp
+                            src/mount/AgentCommand.cpp
+                            src/mount/MountAgent.cpp
                             src/mount/MountStateStore.cpp
+                            src/mount/MountFileSystem.cpp
                             src/mount/ProcessRunner.cpp)
+   target_sources(flaccd-mount PRIVATE src/shell/ShellRegistration.cpp)
    target_link_libraries(flaccd-mount PUBLIC flaccd-core)
    set_target_properties(flaccd-mount PROPERTIES CXX_EXTENSIONS OFF)
 endif()
 
 if(WIN32)
-   add_library(flaccd-imgdrive src/mount/WindowsImgDriveHost.cpp)
-   target_link_libraries(flaccd-imgdrive PUBLIC flaccd-mount PRIVATE advapi32 shell32 ole32 user32 uuid)
+   target_compile_definitions(flaccd-mount PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
+   add_library(flaccd-imgdrive ${flaccdLibraryType} src/mount/WindowsImgDriveHost.cpp src/mount/WindowsAgentIpc.cpp src/mount/WindowsAgentClient.cpp)
+   target_sources(flaccd-imgdrive PRIVATE src/shell/WindowsShellRegistry.cpp)
+   target_link_libraries(flaccd-imgdrive PUBLIC flaccd-mount PRIVATE advapi32 shell32 ole32 user32 uuid setupapi cfgmgr32)
    target_compile_definitions(flaccd-imgdrive PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
    set_target_properties(flaccd-imgdrive PROPERTIES CXX_EXTENSIONS OFF)
+   find_package(Threads REQUIRED)
+   target_link_libraries(flaccd-imgdrive PRIVATE Threads::Threads)
+   add_executable(flaccd-agent apps/FlaccdAgent.cpp)
+   target_link_libraries(flaccd-agent PRIVATE flaccd-imgdrive)
+   target_compile_definitions(flaccd-agent PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
+   set_target_properties(flaccd-agent PROPERTIES CXX_EXTENSIONS OFF)
+   if(MINGW)
+      target_link_options(flaccd-agent PRIVATE -municode)
+   endif()
    add_executable(flaccd apps/Flaccd.cpp)
+   add_dependencies(flaccd flaccd-agent)
    target_link_libraries(flaccd PRIVATE flaccd-imgdrive)
    target_compile_definitions(flaccd PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
    set_target_properties(flaccd PROPERTIES CXX_EXTENSIONS OFF)
@@ -55,16 +82,75 @@ if(WIN32)
       target_compile_options(flaccd-mount PRIVATE /utf-8)
       target_compile_options(flaccd-imgdrive PRIVATE /utf-8)
       target_compile_options(flaccd PRIVATE /utf-8)
+      target_compile_options(flaccd-agent PRIVATE /utf-8)
    endif()
 endif()
 
 if(BUILD_TESTING)
+   add_test(NAME installer-payload COMMAND "${CMAKE_COMMAND}"
+      "-DsourceRoot=${PROJECT_SOURCE_DIR}"
+      "-DtestDirectory=${CMAKE_CURRENT_BINARY_DIR}/installer-fixtures"
+      -P "${PROJECT_SOURCE_DIR}/tests/InstallerPayloadTests.cmake")
+   add_executable(flaccd-shell-tests tests/ShellRegistrationTests.cpp)
+   target_link_libraries(flaccd-shell-tests PRIVATE flaccd-mount)
+   set_target_properties(flaccd-shell-tests PROPERTIES CXX_EXTENSIONS OFF)
+   add_test(NAME shell-registration COMMAND flaccd-shell-tests)
+   if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+      add_test(NAME static-flac-selection COMMAND "${CMAKE_COMMAND}"
+         "-DsourceRoot=${CMAKE_CURRENT_SOURCE_DIR}"
+         "-DtestDirectory=${CMAKE_CURRENT_BINARY_DIR}/dependency-fixtures"
+         "-DcompilerPath=${CMAKE_CXX_COMPILER}"
+         "-DfixtureGenerator=${CMAKE_GENERATOR}"
+         -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/StaticFlacTests.cmake")
+   endif()
+   # Host binutils can build tiny real PE fixtures without Windows headers,
+   # MinGW runtimes, or executing target code (also useful on native Linux).
+   get_filename_component(toolDirectory "${CMAKE_CXX_COMPILER}" DIRECTORY)
+   find_program(flaccdFixtureAssembler NAMES as HINTS "${toolDirectory}" NO_CMAKE_FIND_ROOT_PATH)
+   if(flaccdFixtureAssembler AND CMAKE_LINKER AND CMAKE_OBJCOPY AND CMAKE_OBJDUMP)
+      execute_process(COMMAND "${CMAKE_LINKER}" -V OUTPUT_VARIABLE linkerEmulations ERROR_QUIET)
+      execute_process(COMMAND "${flaccdFixtureAssembler}" --version OUTPUT_VARIABLE assemblerVersion ERROR_QUIET)
+      if(linkerEmulations MATCHES "i386pep" AND assemblerVersion MATCHES "GNU assembler")
+         add_test(NAME windows-deployment COMMAND "${CMAKE_COMMAND}"
+            "-DsourceRoot=${CMAKE_CURRENT_SOURCE_DIR}"
+            "-DtestDirectory=${CMAKE_CURRENT_BINARY_DIR}/deployment-fixtures"
+            "-Dassembler=${flaccdFixtureAssembler}"
+            "-Dlinker=${CMAKE_LINKER}"
+            "-Dobjcopy=${CMAKE_OBJCOPY}"
+            "-DpeObjdump=${CMAKE_OBJDUMP}"
+            "-DcompilerPath=${CMAKE_CXX_COMPILER}"
+            "-Darchiver=${CMAKE_AR}"
+            "-DhostIsLinux=$<STREQUAL:${CMAKE_HOST_SYSTEM_NAME},Linux>"
+            "-DisCrossCompiling=${CMAKE_CROSSCOMPILING}"
+            "-DfixtureGenerator=${CMAKE_GENERATOR}"
+            "-DcompilerIsGnu=$<STREQUAL:${CMAKE_CXX_COMPILER_ID},GNU>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/WindowsDeploymentTests.cmake")
+      endif()
+   endif()
+   add_executable(flaccd-process-diagnostic-tests tests/ProcessArgumentDiagnosticsTests.cpp)
+   target_compile_features(flaccd-process-diagnostic-tests PRIVATE cxx_std_20)
+   set_target_properties(flaccd-process-diagnostic-tests PROPERTIES CXX_EXTENSIONS OFF)
+   add_test(NAME process-argument-diagnostics COMMAND flaccd-process-diagnostic-tests)
    if(WIN32)
+      add_executable(flaccd-windows-shell-tests tests/WindowsShellTests.cpp)
+      target_link_libraries(flaccd-windows-shell-tests PRIVATE flaccd-imgdrive ole32 shell32 advapi32)
+      add_executable(flaccd-shell-probe tests/WindowsShellProbe.cpp)
+      target_compile_features(flaccd-shell-probe PRIVATE cxx_std_20)
+      foreach(target IN ITEMS flaccd-windows-shell-tests flaccd-shell-probe)
+         target_compile_definitions(${target} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
+         set_target_properties(${target} PROPERTIES CXX_EXTENSIONS OFF)
+         if(MINGW)
+            target_link_options(${target} PRIVATE -municode)
+         endif()
+      endforeach()
+      add_test(NAME windows-shell-registration COMMAND flaccd-windows-shell-tests "$<TARGET_FILE:flaccd-shell-probe>")
+      set_tests_properties(windows-shell-registration PROPERTIES TIMEOUT 45)
       add_executable(flaccd-process-probe tests/WindowsProcessProbe.cpp)
       target_link_libraries(flaccd-process-probe PRIVATE flaccd-core)
       add_executable(flaccd-windows-process-tests tests/WindowsProcessTests.cpp)
       target_link_libraries(flaccd-windows-process-tests PRIVATE flaccd-imgdrive)
       foreach(target IN ITEMS flaccd-process-probe flaccd-windows-process-tests)
+         target_compile_definitions(${target} PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN)
          set_target_properties(${target} PROPERTIES CXX_EXTENSIONS OFF)
          if(MINGW)
             target_link_options(${target} PRIVATE -municode)
@@ -75,9 +161,38 @@ if(BUILD_TESTING)
       endforeach()
       add_test(NAME windows-process COMMAND flaccd-windows-process-tests "$<TARGET_FILE:flaccd-process-probe>")
       add_test(NAME mount-cli-help COMMAND flaccd --help)
+      add_executable(flaccd-windows-agent-tests tests/WindowsAgentTests.cpp)
+      target_link_libraries(flaccd-windows-agent-tests PRIVATE flaccd-imgdrive)
+      target_compile_definitions(flaccd-windows-agent-tests PRIVATE NOMINMAX WIN32_LEAN_AND_MEAN _WIN32_WINNT=0x0A00)
+      set_target_properties(flaccd-windows-agent-tests PROPERTIES CXX_EXTENSIONS OFF)
+      if(MINGW)
+         target_link_options(flaccd-windows-agent-tests PRIVATE -municode)
+      endif()
+      if(MSVC)
+         target_compile_options(flaccd-windows-agent-tests PRIVATE /utf-8)
+      endif()
+      add_executable(flaccd-agent-cli-probe tests/WindowsAgentCliProbe.cpp)
+      target_link_libraries(flaccd-agent-cli-probe PRIVATE flaccd-imgdrive)
+      set_target_properties(flaccd-agent-cli-probe PROPERTIES CXX_EXTENSIONS OFF)
+      if(MINGW)
+         target_link_options(flaccd-agent-cli-probe PRIVATE -municode)
+      endif()
+      if(MSVC)
+         target_compile_options(flaccd-agent-cli-probe PRIVATE /utf-8)
+      endif()
+      add_test(NAME windows-agent-ipc COMMAND flaccd-windows-agent-tests "$<TARGET_FILE:flaccd-agent-cli-probe>")
+      set_tests_properties(windows-agent-ipc PROPERTIES TIMEOUT 90)
+      if(MINGW AND NOT CMAKE_CROSSCOMPILING)
+         add_test(NAME windows-deployment-smoke COMMAND "${CMAKE_COMMAND}"
+            "-DbuildRoot=${CMAKE_BINARY_DIR}"
+            "-Dconfiguration=$<CONFIG>"
+            -P "${CMAKE_CURRENT_SOURCE_DIR}/cmake/CheckWindowsDeployment.cmake")
+         set_tests_properties(windows-deployment-smoke PROPERTIES TIMEOUT 120)
+      endif()
    endif()
+   find_package(Threads REQUIRED)
    add_executable(flaccd-imgdrive-tests tests/ImgDriveBackendTests.cpp)
-   target_link_libraries(flaccd-imgdrive-tests PRIVATE flaccd-mount)
+   target_link_libraries(flaccd-imgdrive-tests PRIVATE flaccd-mount Threads::Threads)
    set_target_properties(flaccd-imgdrive-tests PROPERTIES CXX_EXTENSIONS OFF)
    if(MSVC)
       target_compile_options(flaccd-imgdrive-tests PRIVATE /utf-8)
@@ -101,7 +216,7 @@ if(BUILD_TESTING)
       -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/BinCueCliTests.cmake")
    set_tests_properties(bin-cue-cli PROPERTIES FIXTURES_REQUIRED cddaFixtures)
    add_executable(flaccd-cdda-tests tests/CddaSectorReaderTests.cpp)
-   target_link_libraries(flaccd-cdda-tests PRIVATE flaccd-core PkgConfig::FLAC)
+   target_link_libraries(flaccd-cdda-tests PRIVATE flaccd-core flaccd::flac)
    set_target_properties(flaccd-cdda-tests PROPERTIES CXX_EXTENSIONS OFF)
    add_test(NAME cdda-reader COMMAND flaccd-cdda-tests "${CMAKE_CURRENT_BINARY_DIR}/cdda-fixtures")
    set_tests_properties(cdda-reader PROPERTIES FIXTURES_SETUP cddaFixtures)
@@ -155,3 +270,8 @@ if(BUILD_TESTING)
    add_test(NAME cli-no-arguments COMMAND flaccd-info)
    set_tests_properties(cli-no-arguments PROPERTIES WILL_FAIL TRUE)
 endif()
+
+include(cmake/WindowsDeployment.cmake)
+configureWindowsDeployment()
+include(cmake/WindowsInstaller.cmake)
+configureWindowsInstaller()

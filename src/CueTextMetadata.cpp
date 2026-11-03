@@ -87,6 +87,9 @@ std::uint64_t parseCueTimestamp(std::string_view timestamp) {
 }
 
 CueTextMetadata parseCueTextMetadata(std::string_view text) {
+   if (text.starts_with("\xef\xbb\xbf")) {
+      text.remove_prefix(3);
+   }
    CueTextMetadata result;
    bool inTracks = false;
    bool foundFile = false;

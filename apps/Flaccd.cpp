@@ -1,148 +1,56 @@
-#include "flaccd/mount/ImgDriveBackend.h"
+#include "flaccd/mount/WindowsAgentClient.h"
 #include "flaccd/mount/WindowsImgDriveHost.h"
 #include "flaccd/PathText.h"
+#include "flaccd/shell/WindowsShellRegistry.h"
 
 #include <windows.h>
 
-#include <charconv>
 #include <iostream>
-#include <set>
-#include <stdexcept>
 
 namespace {
 
 void printUsage() {
    std::cout << "Usage:\n"
-             << "  flaccd mount FILE.flac --drive D: [--layout native|text|auto]\n"
+             << "  flaccd mount FILE.flac [--drive D:|auto] [--layout native|text|auto] [--no-copy]\n"
              << "  flaccd unmount D:\n"
              << "  flaccd status\n"
              << "  flaccd drives\n"
+             << "  flaccd agent stop [--timeout SECONDS]\n"
+             << "  flaccd shell install|uninstall|status\n"
              << "Options (after command):\n"
-             << "  --imgdrive PATH.exe    Explicit installed executable (or FLACCD_IMGDRIVE)\n"
+             << "  --imgdrive PATH.exe    Installed executable (or FLACCD_IMGDRIVE)\n"
              << "  --cache-dir DIR        Persistent cache; default LocalAppData/FlacCD/ImgDrive/v1\n"
-             << "  --timeout SECONDS      Per-phase timeout, 1..600; default 30\n"
-             << "Auto layout rejects conflicts and prefers agreeing native geometry.\n"
-             << "Drive auto-selection is disabled until ImgDrive -l output is qualified.\n"
-             << "Use flaccd drives and select an existing, empty, visible ImgDrive drive.\n"
-             << "Mounting creates a cached CUE referencing the original FLAC; no BIN is created.\n"
-             << "Unmount affects only a recorded FlacCD CUE, never unrelated media.\n";
+             << "  --timeout SECONDS      1..600; default 30; total deadline for agent stop\n"
+             << "Other commands start a per-user agent as needed; agent stop never starts one.\n"
+             << "Auto selects an identified, visible, empty ImgDrive device. Physical drives are refused.\n"
+             << "Mounting reuses/creates an adjacent CUE, else stages a hard link or compressed copy.\n"
+             << "--no-copy forbids compressed copies. No BIN is generated.\n"
+             << "External eject cleanup normally takes 5..10 seconds after empty media is confirmed.\n"
+             << "Unknown/missing devices and uncertain mounts retain resources for inspection.\n"
+             << "agent stop retains mounts; agent-stop is an alias. No service/admin rights.\n"
+             << "Changing the running agent's executable/cache requires agent stop first.\n";
+   std::cout << "shell install registers Mount as Audio CD for this user without changing the FLAC default.\n"
+             << "Run from the final deployment folder; shell uninstall removes the registration.\n"
+             << "Windows 11 may show the command under Show more options.\n";
 }
 
-char parseDrive(std::string_view text) {
-   if (text.size() != 2 || text[1] != ':') {
-      throw std::invalid_argument("drive must be a letter followed by a colon, such as D:");
-   }
-   char drive = text[0];
-   if (drive >= 'a' && drive <= 'z') {
-      drive = static_cast<char>(drive - 'a' + 'A');
-   }
-   if (drive < 'D' || drive > 'Z') {
-      throw std::invalid_argument("drive must be D: through Z:");
-   }
-   return drive;
-}
-
-std::string mediaName(flaccd::MediaState state) {
-   switch (state) {
-   case flaccd::MediaState::Missing: return "drive missing/hidden";
-   case flaccd::MediaState::Empty: return "no media (stale if recorded mounted)";
-   case flaccd::MediaState::Ready: return "media ready (current image identity not queried)";
-   case flaccd::MediaState::Unknown: return "media status unknown";
-   }
-   return "unknown";
-}
-
-int run(const std::vector<std::string>& arguments) {
-   if (arguments.size() == 1 && arguments[0] == "--help") {
+int run(std::vector<std::string> arguments) {
+   if (arguments.empty() || (arguments.size() == 1 && arguments[0] == "--help")) {
       printUsage();
+      return arguments.empty() ? 2 : 0;
+   }
+   if (arguments[0] == "shell") {
+      if (arguments.size() != 2) {
+         throw std::invalid_argument("Usage: flaccd shell install|uninstall|status");
+      }
+      flaccd::WindowsShellRegistry registry;
+      std::cout << flaccd::runShellCommand(registry, arguments[1], flaccd::shellExecutablePath());
       return 0;
    }
-   if (arguments.empty()) {
-      printUsage();
-      return 2;
-   }
-   const auto& command = arguments[0];
-   if (command != "mount" && command != "unmount" && command != "status" && command != "drives") {
-      throw std::invalid_argument("unknown command; use flaccd --help");
-   }
-   std::optional<char> drive;
-   std::filesystem::path input;
-   std::size_t position = 1;
-   if (command == "mount" || command == "unmount") {
-      if (arguments.size() <= position || arguments[position].starts_with("--")) {
-         throw std::invalid_argument("missing FLAC filename or drive");
-      }
-      if (command == "mount") {
-         input = flaccd::pathFromUtf8(arguments[position++]);
-      } else {
-         drive = parseDrive(arguments[position++]);
-      }
-   }
-   std::filesystem::path executable;
-   std::filesystem::path cache;
-   std::string layout = "auto";
-   std::chrono::seconds timeout(30);
-   std::set<std::string> seen;
-   while (position < arguments.size()) {
-      const auto option = arguments[position++];
-      if (!seen.insert(option).second || position == arguments.size()) {
-         throw std::invalid_argument("duplicate option or missing value: " + option);
-      }
-      const auto& value = arguments[position++];
-      if (option == "--imgdrive") {
-         executable = flaccd::pathFromUtf8(value);
-      } else if (option == "--cache-dir") {
-         cache = flaccd::pathFromUtf8(value);
-      } else if (option == "--timeout") {
-         unsigned seconds = 0;
-         const auto result = std::from_chars(value.data(), value.data() + value.size(), seconds);
-         if (result.ec != std::errc{} || result.ptr != value.data() + value.size() || seconds == 0 || seconds > 600) {
-            throw std::invalid_argument("--timeout must be 1..600 seconds");
-         }
-         timeout = std::chrono::seconds(seconds);
-      } else if (option == "--layout" && command == "mount") {
-         if (value != "auto" && value != "native" && value != "text") {
-            throw std::invalid_argument("--layout must be auto, native, or text");
-         }
-         layout = value;
-      } else if (option == "--drive" && command == "mount") {
-         drive = parseDrive(value);
-      } else {
-         throw std::invalid_argument("unknown or inapplicable option: " + option);
-      }
-   }
-   executable = flaccd::findImgDrive(executable);
-   if (cache.empty()) {
-      cache = flaccd::defaultMountCache();
-   }
-   std::cerr << "ImgDrive: " << flaccd::pathToUtf8(executable) << "\nCache: " << flaccd::pathToUtf8(cache) << '\n';
-   flaccd::WindowsImgDriveHost host;
-   flaccd::ImgDriveBackend backend(host, executable, cache, timeout);
-   if (command == "mount") {
-      const auto record = backend.mount(input, drive, layout);
-      std::cout << "Mounted " << flaccd::pathToUtf8(record.sourcePath) << " on " << record.drive << ":\n"
-                << "Persistent CUE: " << flaccd::pathToUtf8(record.cuePath) << '\n';
-   } else if (command == "unmount") {
-      backend.unmount(*drive);
-      std::cout << "Unmount confirmed; owned CUE/state removed.\n";
-   } else if (command == "drives") {
-      const auto listing = backend.drives();
-      std::cout << "ImgDrive -l output (not parsed):\n" << listing;
-      if (listing.empty()) {
-         std::cout << "No captured listing. Select/check an empty virtual drive in ImgDrive's GUI.\n";
-      }
-   } else {
-      const auto mounts = backend.status();
-      if (mounts.empty()) {
-         std::cout << "No FlacCD mount records. Use flaccd drives for ImgDrive's complete list.\n";
-      }
-      for (const auto& item : mounts) {
-         std::cout << item.record.drive << ": recorded " << flaccd::mountStateName(item.record.state)
-                   << "; " << mediaName(item.media) << "\n  FLAC: " << flaccd::pathToUtf8(item.record.sourcePath)
-                   << "\n  CUE: " << flaccd::pathToUtf8(item.record.cuePath) << '\n';
-      }
-   }
-   return 0;
+   const auto reply = flaccd::runWindowsAgentClient(std::move(arguments));
+   std::cout << reply.output;
+   std::cerr << reply.diagnostics;
+   return static_cast<int>(reply.exitCode);
 }
 
 }
@@ -154,7 +62,7 @@ int wmain(int argumentCount, wchar_t* arguments[]) {
       for (int position = 1; position < argumentCount; ++position) {
          text.push_back(flaccd::pathToUtf8(std::filesystem::path(arguments[position])));
       }
-      return run(text);
+      return run(std::move(text));
    } catch (const std::invalid_argument& error) {
       std::cerr << "flaccd: " << error.what() << '\n';
       return 2;

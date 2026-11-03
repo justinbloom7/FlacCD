@@ -5,6 +5,8 @@
 #include <winioctl.h>
 #include <ntddcdrm.h>
 #include <shlobj.h>
+#include <setupapi.h>
+#include <cfgmgr32.h>
 
 #include <algorithm>
 #include <array>
@@ -243,7 +245,7 @@ ProcessResult WindowsImgDriveHost::run(const std::filesystem::path& executable,
          }
          std::array<char, 4096> bytes{};
          DWORD count = 0;
-         if (!ReadFile(readPipe.get(), bytes.data(), std::min<DWORD>(available, bytes.size()), &count, nullptr)) {
+         if (!ReadFile(readPipe.get(), bytes.data(), std::min<DWORD>(available, static_cast<DWORD>(bytes.size())), &count, nullptr)) {
             break;
          }
          constexpr std::size_t MAX_DIAGNOSTICS = 65536;
@@ -297,13 +299,17 @@ MediaState WindowsImgDriveHost::inspectDrive(char drive) {
 }
 
 bool WindowsImgDriveHost::matchesLayout(char drive, const TrackLayout& layout) {
+   const auto reject = [&](const std::string& reason) {
+      tocDiagnostic = std::string(1, drive) + ": " + reason;
+      return false;
+   };
    WindowsHandle device(openDrive(drive));
    if (device.get() == INVALID_HANDLE_VALUE) {
-      return false;
+      return reject(windowsError("open optical drive for TOC"));
    }
    const auto tracks = layout.getTracks();
    if (tracks.empty()) {
-      return false;
+      return reject("expected layout has no tracks");
    }
    CDROM_TOC toc{};
    CDROM_READ_TOC_EX request{};
@@ -313,11 +319,12 @@ bool WindowsImgDriveHost::matchesLayout(char drive, const TrackLayout& layout) {
    DWORD returned = 0;
    if (!DeviceIoControl(device.get(), IOCTL_CDROM_READ_TOC_EX, &request, sizeof(request),
                         &toc, sizeof(toc), &returned, nullptr)) {
-      return false;
+      return reject(windowsError("IOCTL_CDROM_READ_TOC_EX"));
    }
    if (toc.FirstTrack != tracks.front().number || toc.LastTrack != tracks.back().number ||
        returned < offsetof(CDROM_TOC, TrackData) + (tracks.size() + 1) * sizeof(TRACK_DATA)) {
-      return false;
+      return reject("TOC track range/length differs: first=" + std::to_string(toc.FirstTrack) +
+                    " last=" + std::to_string(toc.LastTrack) + " bytes=" + std::to_string(returned));
    }
    for (std::size_t position = 0; position < tracks.size(); ++position) {
       const auto& expected = tracks[position];
@@ -329,17 +336,124 @@ bool WindowsImgDriveHost::matchesLayout(char drive, const TrackLayout& layout) {
           ((actual.Control & 1) != 0) != expected.flags.preEmphasis ||
           (expected.flags.digitalCopyPermitted && ((actual.Control & 2) != 0) != *expected.flags.digitalCopyPermitted) ||
           indexOne == expected.indices.end() || tocLba(actual) != indexOne->discLba) {
-         return false;
+         return reject("track " + std::to_string(expected.number) + " TOC differs: number=" +
+                       std::to_string(actual.TrackNumber) + " control=" + std::to_string(actual.Control) +
+                       " actual LBA=" + std::to_string(tocLba(actual)) + " expected INDEX 01=" +
+                       (indexOne == expected.indices.end() ? "missing" : std::to_string(indexOne->discLba)));
       }
    }
-   return toc.TrackData[tracks.size()].TrackNumber == 0xaa &&
+   const bool matched = toc.TrackData[tracks.size()].TrackNumber == 0xaa &&
           tocLba(toc.TrackData[tracks.size()]) == layout.getLeadOut().discLba;
+   tocDiagnostic = matched ? "TOC matches" : "TOC lead-out differs: actual=" +
+      std::to_string(tocLba(toc.TrackData[tracks.size()])) + " expected=" + std::to_string(layout.getLeadOut().discLba);
+   return matched;
+}
+
+std::string WindowsImgDriveHost::layoutDiagnostic() const {
+   return tocDiagnostic;
+}
+
+std::vector<OpticalDrive> WindowsImgDriveHost::opticalDrives() {
+   struct DeviceSet {
+      HDEVINFO handle = SetupDiGetClassDevsW(&GUID_DEVINTERFACE_CDROM, nullptr, nullptr,
+                                            DIGCF_PRESENT | DIGCF_DEVICEINTERFACE);
+      ~DeviceSet() {
+         if (handle != INVALID_HANDLE_VALUE) {
+            SetupDiDestroyDeviceInfoList(handle);
+         }
+      }
+   } devices;
+   if (devices.handle == INVALID_HANDLE_VALUE) {
+      throw std::runtime_error(windowsError("enumerate optical devices"));
+   }
+   std::vector<OpticalDrive> result;
+   for (char letter = 'D'; letter <= 'Z'; ++letter) {
+      if (GetDriveTypeW(rootPath(letter).c_str()) != DRIVE_CDROM) {
+         continue;
+      }
+      OpticalDrive drive;
+      drive.letter = letter;
+      drive.media = inspectDrive(letter);
+      WindowsHandle volume(openDrive(letter, 0));
+      STORAGE_DEVICE_NUMBER number{};
+      DWORD returned = 0;
+      const bool numbered = volume.get() != INVALID_HANDLE_VALUE &&
+         DeviceIoControl(volume.get(), IOCTL_STORAGE_GET_DEVICE_NUMBER, nullptr, 0,
+                         &number, sizeof(number), &returned, nullptr) && returned >= sizeof(number);
+      for (DWORD index = 0; numbered; ++index) {
+         SP_DEVICE_INTERFACE_DATA item{};
+         item.cbSize = sizeof(item);
+         if (!SetupDiEnumDeviceInterfaces(devices.handle, nullptr, &GUID_DEVINTERFACE_CDROM, index, &item)) {
+            if (GetLastError() != ERROR_NO_MORE_ITEMS) {
+               throw std::runtime_error(windowsError("enumerate optical interface"));
+            }
+            break;
+         }
+         DWORD bytes = 0;
+         SetupDiGetDeviceInterfaceDetailW(devices.handle, &item, nullptr, 0, &bytes, nullptr);
+         if (bytes < sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W)) {
+            continue;
+         }
+         std::vector<std::byte> buffer(bytes);
+         auto* detail = reinterpret_cast<SP_DEVICE_INTERFACE_DETAIL_DATA_W*>(buffer.data());
+         detail->cbSize = sizeof(SP_DEVICE_INTERFACE_DETAIL_DATA_W);
+         SP_DEVINFO_DATA info{};
+         info.cbSize = sizeof(info);
+         if (!SetupDiGetDeviceInterfaceDetailW(devices.handle, &item, detail, bytes, nullptr, &info)) {
+            continue;
+         }
+         WindowsHandle device(CreateFileW(detail->DevicePath, 0, FILE_SHARE_READ | FILE_SHARE_WRITE,
+                                           nullptr, OPEN_EXISTING, 0, nullptr));
+         STORAGE_DEVICE_NUMBER candidate{};
+         if (device.get() == INVALID_HANDLE_VALUE ||
+             !DeviceIoControl(device.get(), IOCTL_STORAGE_GET_DEVICE_NUMBER, nullptr, 0,
+                              &candidate, sizeof(candidate), &returned, nullptr) ||
+             returned < sizeof(candidate) || candidate.DeviceType != number.DeviceType ||
+             candidate.DeviceNumber != number.DeviceNumber) {
+            continue;
+         }
+         std::array<wchar_t, MAX_DEVICE_ID_LEN> id{};
+         if (CM_Get_Device_IDW(info.DevInst, id.data(), static_cast<ULONG>(id.size()), 0) != CR_SUCCESS) {
+            continue;
+         }
+         drive.identity = pathToUtf8(std::filesystem::path(id.data()));
+         auto node = info.DevInst;
+         for (int depth = 0; depth < 16; ++depth) {
+            std::array<wchar_t, 1024> service{};
+            ULONG size = static_cast<ULONG>(service.size() * sizeof(wchar_t));
+            ULONG type = 0;
+            if (CM_Get_DevNode_Registry_PropertyW(node, CM_DRP_SERVICE, &type, service.data(), &size, 0) == CR_SUCCESS &&
+                type == REG_SZ && size <= service.size() * sizeof(wchar_t)) {
+               service.back() = L'\0';
+               drive.description += "service=" + pathToUtf8(std::filesystem::path(service.data())) + " ";
+               // Match the actual PnP driver service, not a friendly optical
+               // name, physical-drive emptiness, or an assumed SCSI target ID.
+               drive.imgDrive = drive.imgDrive || _wcsicmp(service.data(), L"ImgDrive") == 0;
+            }
+            DEVINST parent = 0;
+            if (CM_Get_Parent(&parent, node, 0) != CR_SUCCESS) {
+               break;
+            }
+            node = parent;
+         }
+         break;
+      }
+      if (drive.identity.empty()) {
+         drive.description = "PnP identity unavailable; selection refused";
+      }
+      result.push_back(std::move(drive));
+   }
+   return result;
 }
 
 std::optional<std::vector<char>> WindowsImgDriveHost::emptyDrives() {
-   // Vendor documents -l but not its schema or an image-identity query. Do not
-   // parse guessed/localized text or treat physical empty CD drives as ImgDrive.
-   return std::nullopt;
+   std::vector<char> result;
+   for (const auto& drive : opticalDrives()) {
+      if (drive.imgDrive && !drive.identity.empty() && drive.media == MediaState::Empty) {
+         result.push_back(drive.letter);
+      }
+   }
+   return result;
 }
 
 std::unique_ptr<MountLock> WindowsImgDriveHost::lock(const std::filesystem::path& cache,

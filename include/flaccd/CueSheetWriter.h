@@ -16,4 +16,10 @@ std::string generateFlacCueSheet(const TrackLayout& layout,
                                  const FlacMetadata& metadata,
                                  const std::filesystem::path& sourcePath);
 
+// Relative, filename-only FLAC reference for backend staging. No filesystem
+// access is performed; callers resolve/verify the adjacent audio themselves.
+std::string generateRelativeFlacCueSheet(const TrackLayout& layout,
+                                         const FlacMetadata& metadata,
+                                         const std::string& sourceName);
+
 }

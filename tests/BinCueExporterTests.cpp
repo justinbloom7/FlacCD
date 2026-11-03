@@ -9,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 
 namespace {
 
@@ -26,6 +27,28 @@ void expectError(Operation operation) {
       return;
    }
    throw std::runtime_error("Expected export rejection");
+}
+
+bool isSymlinkUnavailable(const std::error_code& error) {
+   // Compare conditions, not message text or platform-specific errno numbers.
+   // This also recognizes mapped Windows errors such as missing privileges.
+   return error == std::errc::function_not_supported || error == std::errc::not_supported ||
+          error == std::errc::operation_not_supported || error == std::errc::permission_denied ||
+          error == std::errc::operation_not_permitted;
+}
+
+void testSymlinkErrorClassification() {
+   for (const auto condition : {std::errc::function_not_supported, std::errc::not_supported,
+                                std::errc::operation_not_supported, std::errc::permission_denied,
+                                std::errc::operation_not_permitted}) {
+      require(isSymlinkUnavailable(std::make_error_code(condition)), "Symlink capability error not recognized");
+   }
+   for (const auto condition : {std::errc::file_exists, std::errc::no_such_file_or_directory,
+                                std::errc::io_error, std::errc::no_space_on_device,
+                                std::errc::invalid_argument, std::errc::read_only_file_system}) {
+      require(!isSymlinkUnavailable(std::make_error_code(condition)), "Unexpected filesystem error would be skipped");
+   }
+   require(!isSymlinkUnavailable({}), "Successful symlink creation must not be skipped");
 }
 
 std::string readFile(const std::filesystem::path& path) {
@@ -150,10 +173,21 @@ void testErrors(const std::filesystem::path& input,
       require(!std::filesystem::exists(existing == cuePath ? binPath : cuePath), "Failed pair left a new output");
       std::filesystem::remove(existing);
    }
-   std::filesystem::create_symlink(input, binPath);
-   expectError([&] { flaccd::exportBinCue(input, layout, cuePath); });
-   require(std::filesystem::is_symlink(binPath), "Overwrote symlink");
-   std::filesystem::remove(binPath);
+   std::error_code symlinkError;
+   std::filesystem::create_symlink(input, binPath, symlinkError);
+   if (symlinkError) {
+      if (!isSymlinkUnavailable(symlinkError)) {
+         throw std::filesystem::filesystem_error("Cannot create symlink fixture", input, binPath, symlinkError);
+      }
+      std::cout << "SKIP: BIN/CUE symlink overwrite case: symbolic links unsupported or not permitted: "
+                << symlinkError.message() << " (" << symlinkError.category().name() << ':'
+                << symlinkError.value() << "). Other overwrite checks still run.\n";
+   } else {
+      expectError([&] { flaccd::exportBinCue(input, layout, cuePath); });
+      require(std::filesystem::is_symlink(binPath), "Overwrote symlink");
+      std::filesystem::remove(binPath);
+      std::cout << "BIN/CUE symlink overwrite case passed\n";
+   }
    std::filesystem::create_hard_link(input, binPath);
    const auto inputSize = std::filesystem::file_size(input);
    expectError([&] { flaccd::exportBinCue(input, layout, cuePath); });
@@ -179,6 +213,7 @@ void testErrors(const std::filesystem::path& input,
 int main(int argumentCount, char* arguments[]) {
    try {
       require(argumentCount == 2, "Expected fixture directory");
+      testSymlinkErrorClassification();
       const auto fixtureDirectory = std::filesystem::absolute(arguments[1]);
       TestDirectory directory(fixtureDirectory);
       const auto input = fixtureDirectory / "fixture-4096.flac";

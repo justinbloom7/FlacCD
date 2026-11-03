@@ -1,6 +1,7 @@
 #pragma once
 
 #include "flaccd/TrackLayout.h"
+#include "flaccd/mount/OpticalDrive.h"
 
 #include <chrono>
 #include <cstdint>
@@ -13,8 +14,6 @@
 #include <vector>
 
 namespace flaccd {
-
-enum class MediaState { Missing, Empty, Ready, Unknown };
 
 struct ProcessResult {
    std::uint32_t exitCode = 0;
@@ -34,7 +33,13 @@ public:
                              std::span<const std::string> arguments,
                              std::chrono::milliseconds timeout) = 0;
    virtual MediaState inspectDrive(char drive) = 0;
+   virtual std::vector<OpticalDrive> opticalDrives() {
+      return {};
+   }
    virtual bool matchesLayout(char drive, const TrackLayout& layout) = 0;
+   virtual std::string layoutDiagnostic() const {
+      return "TOC unavailable or differs from expected layout";
+   }
    // nullopt means no verified, machine-readable enumeration is available.
    virtual std::optional<std::vector<char>> emptyDrives() = 0;
    virtual std::unique_ptr<MountLock> lock(const std::filesystem::path& cache,
