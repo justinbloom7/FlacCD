@@ -11,6 +11,7 @@
 #include <algorithm>
 #include <charconv>
 #include <fstream>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <system_error>
@@ -71,24 +72,34 @@ AgentReply runWindowsRestore(const std::vector<std::string>& arguments) {
    if (!configurationLock) {
       throw std::runtime_error("restoration registration is busy");
    }
-   // Adopt a custom configuration only from this executable's exact startup
-   // schema. Full ownership is checked against that cache's stored command.
+   // Recognize a prior executable location only when the configured cache
+   // independently owns the exact startup command. This permits upgrades to
+   // migrate a development-copy startup entry without adopting foreign values.
    if (!seen.contains("--cache-dir")) {
       const auto startupCommand = registration.read();
       if (startupCommand) {
          int count = 0;
          auto values = CommandLineToArgvW(startupCommand->c_str(), &count);
+         std::unique_ptr<wchar_t*, decltype(&LocalFree)> valuesOwner(values, &LocalFree);
          if (values) {
-            if (count == 8 && _wcsicmp(values[0], shellExecutablePath().c_str()) == 0 &&
+            if (count == 8 &&
                 std::wstring_view(values[1]) == L"restore" && std::wstring_view(values[2]) == L"run" &&
                 std::wstring_view(values[3]) == L"--startup" && std::wstring_view(values[4]) == L"--cache-dir" &&
                 std::wstring_view(values[6]) == L"--imgdrive") {
-               settings.cache = values[5];
-               if (!seen.contains("--imgdrive")) {
-                  settings.imgDrive = values[7];
+               const auto candidateCache = std::filesystem::path(values[5]);
+               bool owned = candidateCache.is_absolute() && _wcsicmp(values[0], shellExecutablePath().c_str()) == 0;
+               if (!owned && candidateCache.is_absolute()) {
+                  const auto candidate = RestoreStore(candidateCache).read();
+                  const auto text = pathToUtf8(std::filesystem::path(*startupCommand));
+                  owned = text == candidate.startupCommand || text == candidate.previousStartupCommand;
+               }
+               if (owned) {
+                  settings.cache = candidateCache;
+                  if (!seen.contains("--imgdrive")) {
+                     settings.imgDrive = values[7];
+                  }
                }
             }
-            LocalFree(values);
          }
       }
    }
@@ -118,6 +129,16 @@ AgentReply runWindowsRestore(const std::vector<std::string>& arguments) {
          reply.output = std::string("Restoration ") + (state.enabled ? "enabled" : "disabled") +
                         "; login registration " + (!current ? "absent" :
                         *current == pathFromUtf8(state.startupCommand).wstring() ? "owned" : "foreign/modified") + "\n";
+         if (current) {
+            reply.output += "Login command: " + pathToUtf8(std::filesystem::path(*current)) + "\n";
+         }
+         reply.output += "Desired mounts: " + std::to_string(state.mounts.size()) + "\n";
+         reply.output += "Restore log: " + pathToUtf8(settings.cache / "restore.log") + "\n";
+         if (!state.enabled) {
+            reply.output += "Use restore enable from the installed copy to enable login restoration.\n";
+         } else if (state.mounts.empty()) {
+            reply.output += "Mount a disc after enabling restoration so it can be remembered.\n";
+         }
          for (const auto& entry : state.mounts) {
             reply.output += std::string(entry.suspended ? "Suspended: " : "Desired: ") + pathToUtf8(entry.source) + "\n";
          }
@@ -134,6 +155,10 @@ AgentReply runWindowsRestore(const std::vector<std::string>& arguments) {
       }
       if (action == "refresh") {
          if (state.enabled) {
+            if (settings.imgDrive.empty()) {
+               settings.imgDrive = std::filesystem::absolute(findImgDrive());
+            }
+            refreshRestoreStartup(registration, store, shellExecutablePath(), settings.cache.wstring(), settings.imgDrive.wstring());
             captureDesiredMounts(host, settings.cache, store, false);
          }
          reply.output = "Restoration maintenance refreshed; only confirmed live mounts rearmed.\n";
@@ -244,9 +269,16 @@ AgentReply runWindowsRestore(const std::vector<std::string>& arguments) {
       if (submittedAt >= deadline) {
          break;
       }
-      settings.requestTimeout = std::chrono::milliseconds(static_cast<std::int64_t>(deadline - submittedAt));
+      const auto remainingBudget = std::chrono::milliseconds(static_cast<std::int64_t>(deadline - submittedAt));
+      const auto attemptTimeout = restoreAttemptTimeout(remainingBudget);
+      if (!attemptTimeout) {
+         break;
+      }
+      settings.requestTimeout = remainingBudget;
       try {
-         reply = runWindowsAgentClient({"restore-step", "--timeout", "1"}, settings);
+         appendLog("Restore attempt: vendor/TOC timeout=" + std::to_string(attemptTimeout->count()) +
+                   " seconds; helper budget=" + std::to_string(remainingBudget.count()) + " ms\n");
+         reply = runWindowsAgentClient({"restore-step", "--timeout", std::to_string(attemptTimeout->count())}, settings);
       } catch (const std::exception& problem) {
          // Submission outcome may be uncertain: never replay after transport loss.
          reply.exitCode = 1;

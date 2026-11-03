@@ -1,5 +1,6 @@
 #include "flaccd/mount/WindowsImgDriveHost.h"
 #include "flaccd/PathText.h"
+#include "flaccd/mount/SessionIdentity.h"
 
 #include <windows.h>
 #include <winioctl.h>
@@ -8,6 +9,7 @@
 #include <setupapi.h>
 #include <cfgmgr32.h>
 #include <sddl.h>
+#include <ntsecapi.h>
 
 #include <algorithm>
 #include <array>
@@ -361,6 +363,25 @@ std::string WindowsImgDriveHost::sessionIdentity() {
       return {};
    }
    WindowsHandle token(rawToken);
+   TOKEN_STATISTICS statistics{};
+   DWORD statisticsSize = 0;
+   if (!GetTokenInformation(token.get(), TokenStatistics, &statistics, sizeof(statistics), &statisticsSize)) {
+      return {};
+   }
+   struct LogonData {
+      PSECURITY_LOGON_SESSION_DATA value = nullptr;
+      ~LogonData() {
+         if (value) {
+            LsaFreeReturnBuffer(value);
+         }
+      }
+   } logon;
+   if (LsaGetLogonSessionData(&statistics.AuthenticationId, &logon.value) != 0 || !logon.value ||
+       logon.value->Size < offsetof(SECURITY_LOGON_SESSION_DATA, LogonTime) + sizeof(LARGE_INTEGER) ||
+       logon.value->LogonTime.QuadPart <= 0) {
+      return {}; // Unknown identity must never authorize eject-intent removal.
+   }
+   const auto logonTime = static_cast<std::uint64_t>(logon.value->LogonTime.QuadPart);
    DWORD size = 0;
    GetTokenInformation(token.get(), TokenGroups, nullptr, 0, &size);
    if (size == 0) {
@@ -379,7 +400,7 @@ std::string WindowsImgDriveHost::sessionIdentity() {
          }
          const auto identity = pathToUtf8(std::filesystem::path(sid));
          LocalFree(sid);
-         return identity;
+         return makeSessionIdentity(identity, logonTime);
       }
    }
    return {};

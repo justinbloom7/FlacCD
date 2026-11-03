@@ -4,6 +4,7 @@
 #include "flaccd/mount/MountCueDiscovery.h"
 #include "flaccd/mount/RestoreCoordinator.h"
 #include "flaccd/mount/RestoreStartup.h"
+#include "flaccd/mount/SessionIdentity.h"
 #include "flaccd/CueSheetWriter.h"
 #include "flaccd/PathText.h"
 
@@ -128,6 +129,7 @@ public:
                              std::chrono::milliseconds timeout) override {
       require(std::filesystem::is_regular_file(executable) && timeout.count() > 0, "process configuration");
       calls.emplace_back(arguments.begin(), arguments.end());
+      processTimeouts.push_back(timeout);
       if (arguments[0] == "-l") {
          return {0, false, "unparsed vendor listing"};
       }
@@ -196,6 +198,9 @@ public:
       if (onPause) {
          onPause();
       }
+      if (readyAt && std::chrono::steady_clock::now() >= *readyAt) {
+         media[pendingDrive] = flaccd::MediaState::Ready;
+      }
       if (readyAfterPauses > 0) {
          require(std::filesystem::exists(pendingCue), "CUE deleted after process exit");
          const auto parsed = flaccd::parseCueTextMetadata(readFile(pendingCue));
@@ -221,6 +226,8 @@ public:
    bool changeMedia = true;
    bool layoutMatches = true;
    int readyAfterPauses = 0;
+   std::optional<std::chrono::steady_clock::time_point> readyAt;
+   std::vector<std::chrono::milliseconds> processTimeouts;
    char pendingDrive = 0;
    std::filesystem::path pendingCue;
    std::map<char, flaccd::MediaState> media;
@@ -1039,6 +1046,34 @@ void testStaleRecovery(const std::filesystem::path& fixtures) {
 }
 
 void testRestoration(const std::filesystem::path& fixtures) {
+   const auto firstLogin = flaccd::makeSessionIdentity("S-1-5-5-0-1234", 100000);
+   const auto rebootedLogin = flaccd::makeSessionIdentity("S-1-5-5-0-1234", 200000);
+   require(firstLogin != rebootedLogin && firstLogin == flaccd::makeSessionIdentity("S-1-5-5-0-1234", 100000) &&
+           flaccd::makeSessionIdentity("S-1-5-5-0-1234", 0).empty(), "logon identity was not stable or reboot-distinct");
+   require(flaccd::restoreAttemptTimeout(std::chrono::seconds(60)) == std::chrono::seconds(15) &&
+           flaccd::restoreAttemptTimeout(std::chrono::seconds(10)) == std::chrono::seconds(5) &&
+           !flaccd::restoreAttemptTimeout(std::chrono::milliseconds(1999)), "restore attempt deadline allocation");
+   {
+      Scenario s(fixtures);
+      flaccd::RestoreStore desired(s.host.cache);
+      flaccd::RestoreState state;
+      state.enabled = true;
+      desired.save(state);
+      s.host.session = firstLogin;
+      flaccd::MountAgent agent(s.host, s.executable, s.host.cache);
+      require(ipc(agent, {"mount", flaccd::pathToUtf8(s.source), "--drive", "D:"}).exitCode == 0,
+              "slow boot fixture mount failed");
+      // Reuse the SID across boots: the login timestamp must distinguish them.
+      s.host.session = rebootedLogin;
+      s.host.media['D'] = flaccd::MediaState::Empty;
+      s.host.changeMedia = false;
+      s.host.onMount = [&] { s.host.readyAt = std::chrono::steady_clock::now() + std::chrono::milliseconds(1200); };
+      flaccd::MountAgent restarted(s.host, s.executable, s.host.cache);
+      const auto timeout = *flaccd::restoreAttemptTimeout(std::chrono::seconds(60));
+      const auto result = ipc(restarted, {"restore-step", "--timeout", std::to_string(timeout.count())});
+      require(result.exitCode == 3 && !desired.read().mounts[0].suspended &&
+              s.host.processTimeouts.back() == timeout, "slow ImgDrive readiness suspended boot restoration");
+   }
    {
       Scenario s(fixtures);
       flaccd::RestoreStore desired(s.host.cache);
@@ -1190,8 +1225,14 @@ void testRestoration(const std::filesystem::path& fixtures) {
       class Startup final : public flaccd::RestoreStartup {
       public:
          std::optional<std::wstring> value;
+         bool denyWrite = false;
          std::optional<std::wstring> read() override { return value; }
-         void write(const std::wstring& command) override { value = command; }
+         void write(const std::wstring& command) override {
+            if (denyWrite) {
+               throw std::runtime_error("startup registration write failed");
+            }
+            value = command;
+         }
          void remove() override { value.reset(); }
       } startup;
       const auto command = flaccd::restoreStartupCommand(L"C:\\Tools & \u97f3\\flaccd.exe", L"C:\\Cache % !", L"C:\\Img Drive\\ImgDrive.exe");
@@ -1207,6 +1248,29 @@ void testRestoration(const std::filesystem::path& fixtures) {
       flaccd::updateRestoreStartup(startup, command, {});
       flaccd::updateRestoreStartup(startup, command, {});
       expectError([&] { flaccd::restoreStartupCommand(std::wstring(261, L'x'), L"cache", L"imgdrive"); }, "260");
+      Scenario s(fixtures);
+      flaccd::RestoreStore desired(s.host.cache);
+      flaccd::RestoreState previous;
+      previous.enabled = true;
+      const auto oldCommand = flaccd::restoreStartupCommand(L"C:\\Build\\flaccd.exe", L"C:\\Cache", L"C:\\ImgDrive.exe");
+      previous.startupCommand = flaccd::pathToUtf8(std::filesystem::path(oldCommand));
+      desired.save(previous);
+      startup.value = oldCommand;
+      const auto installedCommand = flaccd::restoreStartupCommand(L"C:\\Programs\\FlacCD\\flaccd.exe", L"C:\\Cache", L"C:\\ImgDrive.exe");
+      flaccd::refreshRestoreStartup(startup, desired, L"C:\\Programs\\FlacCD\\flaccd.exe", L"C:\\Cache", L"C:\\ImgDrive.exe");
+      require(startup.read() == installedCommand &&
+              desired.read().previousStartupCommand == previous.startupCommand,
+              "upgrade did not migrate owned startup from development copy");
+      const auto installedState = desired.read().startupCommand;
+      startup.value = L"modified foreign startup";
+      expectError([&] { flaccd::refreshRestoreStartup(startup, desired, L"C:\\Other\\flaccd.exe", L"C:\\Cache", L"C:\\ImgDrive.exe"); }, "preserved");
+      require(desired.read().startupCommand == installedState && startup.read() == L"modified foreign startup",
+              "foreign startup refresh changed registry or desired state");
+      startup.value = installedCommand;
+      startup.denyWrite = true;
+      expectError([&] { flaccd::refreshRestoreStartup(startup, desired, L"C:\\New\\flaccd.exe", L"C:\\Cache", L"C:\\ImgDrive.exe"); }, "write failed");
+      require(desired.read().startupCommand == installedState && startup.read() == installedCommand,
+              "failed startup migration did not roll back desired configuration");
    }
 }
 

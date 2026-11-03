@@ -5,6 +5,8 @@
 
 namespace flaccd {
 
+class RestoreStore;
+
 class RestoreStartup {
 public:
    virtual ~RestoreStartup() = default;
@@ -19,5 +21,10 @@ std::wstring restoreStartupCommand(const std::wstring& executable,
 void updateRestoreStartup(RestoreStartup& startup,
                            const std::wstring& ownedCommand,
                            const std::optional<std::wstring>& replacement);
+void refreshRestoreStartup(RestoreStartup& startup,
+                            RestoreStore& store,
+                            const std::wstring& executable,
+                            const std::wstring& cache,
+                            const std::wstring& imgDrive);
 
 }

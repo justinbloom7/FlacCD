@@ -6,6 +6,13 @@
 
 namespace flaccd {
 
+std::optional<std::chrono::seconds> restoreAttemptTimeout(std::chrono::milliseconds remaining) {
+   if (remaining < std::chrono::seconds(2)) {
+      return {};
+   }
+   return std::min(std::chrono::seconds(15), std::chrono::duration_cast<std::chrono::seconds>(remaining / 2));
+}
+
 void captureDesiredMounts(ProcessRunner& host,
                            const std::filesystem::path& cache,
                            RestoreStore& store,

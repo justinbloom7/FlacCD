@@ -1,5 +1,7 @@
 #include "flaccd/mount/WindowsRestore.h"
 #include "flaccd/mount/WindowsImgDriveHost.h"
+#include "flaccd/mount/RestoreStore.h"
+#include "flaccd/PathText.h"
 
 #include <windows.h>
 
@@ -18,9 +20,16 @@ struct TestKey {
    std::wstring path = L"Software\\FlacCD\\RestoreTests\\" + std::to_wstring(GetCurrentProcessId()) +
                        L"-" + std::to_wstring(GetTickCount64());
    bool owned = false;
+   std::filesystem::path cache = std::filesystem::temp_directory_path() /
+      (L"FlacCD restore migration " + std::to_wstring(GetCurrentProcessId()) + L"-" + std::to_wstring(GetTickCount64()));
+   bool ownsCache = false;
    ~TestKey() {
       if (owned) {
          RegDeleteTreeW(HKEY_CURRENT_USER, path.c_str());
+      }
+      if (ownsCache) {
+         std::error_code error;
+         std::filesystem::remove_all(cache, error);
       }
    }
 };
@@ -62,14 +71,29 @@ int wmain() {
       flaccd::updateRestoreStartup(startup, command, {});
       flaccd::updateRestoreStartup(startup, command, {});
       require(!startup.read(), "Native startup removal/idempotence");
+      fixture.ownsCache = std::filesystem::create_directory(fixture.cache);
+      require(fixture.ownsCache, "Migration test cache already exists; preserved");
+      flaccd::RestoreStore desired(fixture.cache);
+      flaccd::RestoreState state;
+      state.enabled = true;
+      state.startupCommand = flaccd::pathToUtf8(std::filesystem::path(command));
+      desired.save(state);
+      startup.write(command);
+      const auto installed = flaccd::restoreStartupCommand(L"C:\\Installed \u97f3\\flaccd.exe", L"C:\\Cache !",
+                                                          L"C:\\Img Drive\\ImgDrive.exe");
+      flaccd::refreshRestoreStartup(startup, desired, L"C:\\Installed \u97f3\\flaccd.exe", L"C:\\Cache !",
+                                    L"C:\\Img Drive\\ImgDrive.exe");
+      require(startup.read() == installed && desired.read().previousStartupCommand == state.startupCommand,
+              "Native Unicode startup relocation did not retain ownership");
+      flaccd::updateRestoreStartup(startup, installed, {});
       wchar_t value[256];
       DWORD bytes = sizeof(value);
       require(RegGetValueW(HKEY_CURRENT_USER, fixture.path.c_str(), L"OtherApp", RRF_RT_REG_SZ,
                             nullptr, value, &bytes) == ERROR_SUCCESS && std::wstring(value) == sentinel,
               "Unrelated startup value changed");
       flaccd::WindowsImgDriveHost host;
-      require(!host.sessionIdentity().empty() && host.sessionIdentity() == host.sessionIdentity(),
-              "Interactive logon SID is unavailable or unstable");
+      require(host.sessionIdentity().find('@') != std::string::npos && host.sessionIdentity() == host.sessionIdentity(),
+              "Interactive logon SID/timestamp is unavailable or unstable");
       std::cout << "Isolated startup registry lifecycle, Unicode quoting and logon identity passed\n";
       return 0;
    } catch (const std::exception& problem) {

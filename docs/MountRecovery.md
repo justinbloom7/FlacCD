@@ -155,6 +155,11 @@ prefer the default local cache. Network music can become available during the
 bounded retries. Missing/moved sources are reported and retained for a future
 login; FlacCD does not scan for substitutes or move the original music.
 
+Each vendor/TOC attempt now gets up to 15 seconds, limited to half the helper's
+remaining budget. The earlier implementation incorrectly gave each attempt only
+one second, which could suspend an otherwise valid restore while ImgDrive was
+still becoming ready. No new mount is submitted with less than two seconds left.
+
 Restoration requires the remembered PnP device (whose current letter may differ)
 to be identified and empty. Occupied/unknown media is not replaced. A possibly
 already-mounted image is not duplicated. Existing managed media is skipped only
@@ -179,7 +184,13 @@ to old intent that might resurrect an ejected disc. Interrupted unpublished
 snapshots are ignored/preserved. Unknown cache contents are not swept.
 
 A [Windows logon SID](https://learn.microsoft.com/en-us/windows/win32/secauthz/access-tokens)
-identifies the interactive session. A confirmed empty-media observation in the
+is paired with its recorded login timestamp to identify the interactive session.
+The SID alone is not a reboot-safe persisted identity: its underlying LUID can
+repeat after restart ([Microsoft explanation](https://devblogs.microsoft.com/oldnewthing/20240830-00/?p=110198)).
+FlacCD queries its own session's immutable LogonTime through the documented
+[LsaGetLogonSessionData API](https://learn.microsoft.com/en-us/windows/win32/api/ntsecapi/nf-ntsecapi-lsagetlogonsessiondata).
+This requires only Windows' Secur32 system library and ordinary ownership of the
+current session. A confirmed empty-media observation in the
 same login removes the corresponding desired mount before artifact cleanup:
 Explorer eject is honored even when resources subsequently cannot be deleted.
 A different login preserves intent during reboot cleanup, allowing restoration.
@@ -193,6 +204,9 @@ the data. A fresh installation never opts the user in automatically.
 Installer maintenance also pauses/drains an existing login helper before file
 replacement. Suspension is checked again before an agent is started, so a
 draining helper cannot automatically restart an agent that was just stopped.
+Upgrade refresh also migrates an exactly owned startup command to the installed
+EXE. A registration left pointing to a development build is no longer retained
+silently. Foreign startup values remain protected.
 
 The helper exits when finished; the existing mount/eject agent continues normal
 monitoring. No second always-running daemon, privileged service, scheduled task
@@ -210,6 +224,17 @@ have the conservative behavior above.
 
 These require the installed Windows build and ImgDrive; they have not been run
 by the Linux development agent. Disable vendor automount for this qualification.
+
+Restoration happens **after user login**, when the per-user startup command runs;
+it does not expose a virtual disc before login. To diagnose a missing restore,
+run the installed copy's `restore status`: it now prints enabled state, the actual
+login command, desired paths/count and log location. Confirm a desired entry is
+not suspended and that the command points to the permanent installation. Check
+Windows Startup Apps has not disabled `FlacCD.Restore`. A missing or unchanged
+`restore.log` after login indicates that the helper may not have run. A fresh log
+explains readiness, source availability, timeout or suspension failures. These
+conditions need different remedies; an empty saved mount record proves none of
+them. Do not enable ImgDrive automount alongside FlacCD's restorer.
 
 ```bash
 cmake --build build-windows
