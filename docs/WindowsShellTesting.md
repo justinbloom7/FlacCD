@@ -14,12 +14,53 @@ cmake --build build-windows --target flaccd-smoke flaccd-package
 The existing 26 Windows tests remain registered. Two additional tests are
 `shell-registration` (portable policy/quoting with a registry mock) and
 `windows-shell-registration` (native HKCU lifecycle and ShellExecute argument
-round trips). The native test creates an isolated `HKCU\Software\FlacCD\ShellTests`
-namespace; it does **not** install the Explorer verb or change file associations.
+round trips). The native test creates an exclusively owned, unique ProgID under
+`HKCU\Software\Classes\FlacCD.ShellTests.<unique ID>` and selects it explicitly
+with `SEE_MASK_CLASSNAME`/`lpClass`. It does **not** associate that ProgID with an
+extension, install the real Explorer verb, or change `.flac`, UserChoice, or
+SystemFileAssociations. Cleanup removes only the newly created test key.
 A harmless probe receives `mount` and the selected filename, records UTF-16
 arguments, and exits. It never contacts ImgDrive or the agent. It tests executable
 folders and filenames containing spaces, Unicode, shell metacharacters, literal
 `%1`, `%L`, `%PATH%`, and `%%`. No shell interprets `&`, `^`, `!`, or parentheses.
+
+### Isolated ShellExecute scope and diagnostics
+
+The earlier fixture passed a generic key outside `Software\Classes` through
+`SEE_MASK_CLASSKEY`. That fixture failed on the developer's Windows system with
+the reported value `2147746293` (`0x800401F5`, `CO_E_APPNOTFOUND`, Application not
+found). It assumed the arbitrary registry tree behaved like a registered file
+class. The replacement uses a genuine, unassociated test ProgID visible through
+HKCR and explicitly verifies that the merged class command equals the command
+written by the production registration implementation before launching it.
+[Microsoft documents](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/ns-shellapi-shellexecuteinfow)
+`lpClass` selection of a ProgID or a shell-verb key under HKCR.
+
+The old assertion also combined FALSE return and missing `hProcess`, reporting
+`GetLastError()` for both. Success does not make that last-error value meaningful,
+and ShellExecute can legitimately succeed without returning a process handle.
+The updated test reports those cases separately. It still requires a new process
+because this test's fresh static command has no DDE or delegate. Launch failures
+include numeric/hex error values, system text, ProgID, registry root, verb, file,
+registered command, hInstApp and process-handle presence. Probe exit, wait, output
+and argument mismatches have separate diagnostics, including escaped expected
+and actual UTF-16 bytes for a mismatch.
+
+This validates native command lookup/expansion, argument delivery and registry
+lifecycle; it does not validate the Explorer menu UI, the user's actual FLAC
+association, or ImgDrive mounting/ejecting. Those remain manual integration
+checks. The old combined assertion cannot establish whether Windows returned
+FALSE or TRUE without a handle, so the precise original internal failure path
+cannot be reconstructed from that message alone. The new diagnostics preserve
+that distinction if a native launch still fails.
+
+Run on Windows:
+
+```bash
+cmake --build build-windows
+ctest --test-dir build-windows -R '^windows-shell-registration$' --output-on-failure
+ctest --test-dir build-windows --output-on-failure
+```
 
 ## Manual Explorer checks
 
