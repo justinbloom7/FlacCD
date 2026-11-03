@@ -1,6 +1,7 @@
 #include "flaccd/mount/WindowsAgentClient.h"
 #include "flaccd/mount/WindowsImgDriveHost.h"
 #include "flaccd/PathText.h"
+#include "flaccd/shell/WindowsShellRegistry.h"
 
 #include <windows.h>
 
@@ -15,6 +16,7 @@ void printUsage() {
              << "  flaccd status\n"
              << "  flaccd drives\n"
              << "  flaccd agent stop [--timeout SECONDS]\n"
+             << "  flaccd shell install|uninstall|status\n"
              << "Options (after command):\n"
              << "  --imgdrive PATH.exe    Installed executable (or FLACCD_IMGDRIVE)\n"
              << "  --cache-dir DIR        Persistent cache; default LocalAppData/FlacCD/ImgDrive/v1\n"
@@ -27,12 +29,23 @@ void printUsage() {
              << "Unknown/missing devices and uncertain mounts retain resources for inspection.\n"
              << "agent stop retains mounts; agent-stop is an alias. No service/admin rights.\n"
              << "Changing the running agent's executable/cache requires agent stop first.\n";
+   std::cout << "shell install registers Mount as Audio CD for this user without changing the FLAC default.\n"
+             << "Run from the final deployment folder; shell uninstall removes the registration.\n"
+             << "Windows 11 may show the command under Show more options.\n";
 }
 
 int run(std::vector<std::string> arguments) {
    if (arguments.empty() || (arguments.size() == 1 && arguments[0] == "--help")) {
       printUsage();
       return arguments.empty() ? 2 : 0;
+   }
+   if (arguments[0] == "shell") {
+      if (arguments.size() != 2) {
+         throw std::invalid_argument("Usage: flaccd shell install|uninstall|status");
+      }
+      flaccd::WindowsShellRegistry registry;
+      std::cout << flaccd::runShellCommand(registry, arguments[1], flaccd::shellExecutablePath());
+      return 0;
    }
    const auto reply = flaccd::runWindowsAgentClient(std::move(arguments));
    std::cout << reply.output;

@@ -473,3 +473,35 @@ ImgDrive in this Linux development session.** Follow
 [WindowsAgentTesting.md](docs/WindowsAgentTesting.md) for Windows builds, evidence
 collection, IPC tests, restart/eject checks and remaining limitations. Previous
 investigation notes remain under `docs/historical/`.
+
+### Windows Explorer integration
+
+From the final deployed FlacCD folder, register the per-user FLAC context menu:
+
+```text
+flaccd.exe shell install
+flaccd.exe shell status
+flaccd.exe shell uninstall
+```
+
+Right-click one `.flac` file and select **Mount as Audio CD**. On Windows 11,
+look under **Show more options**. The command invokes the existing
+`flaccd.exe mount` path, including automatic ImgDrive selection and the background
+agent. ImgDrive must already be installed/configured; normal mount restrictions
+still apply. Registration itself neither requires ImgDrive nor starts the agent.
+
+No administrator privileges are needed. Only the dedicated
+`HKCU\Software\Classes\SystemFileAssociations\.flac\shell\FlacCD.MountAudioCD`
+verb is managed; the default FLAC player/file association is unchanged.
+The registered executable path is absolute, so keep the deployment folder in
+place. Before moving/removing FlacCD, run `shell uninstall`; after moving it,
+run `shell install` from the new location. Repeated install/removal is harmless.
+Modified or foreign registrations are preserved and reported as conflicts.
+`shell status` inspects registration, not ImgDrive readiness or mount state.
+
+This is a console command, so Explorer can briefly open a console window. For
+mount failures, reproduce with `flaccd.exe mount "path\album.flac"` in a terminal
+and inspect the existing agent logs. See
+[WindowsShellTesting.md](docs/WindowsShellTesting.md) for native registry,
+filename quoting and Explorer integration checks. Windows integration has not
+been executed in this Linux development session.
