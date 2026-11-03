@@ -586,3 +586,15 @@ The project implementation has not yet begun.
 
 The immediate next step is to create the CMake project and implement the FLAC metadata inspection utility.
 
+## 12. Project Memory: Working Windows Smoke-Test Baseline
+
+Recorded 2026-11-03 from the developer's manual Windows verification:
+
+- Environment: Windows 10, MSYS2 UCRT64, CMake 4.4.3.
+- Invoking `cmd.exe /C` through CMake `execute_process()` failed in this environment, even for simple commands. Do not assume this was a missing DLL or an application failure.
+- The working fix in `cmake/CheckWindowsDeployment.cmake` executes the batch file directly: `execute_process(COMMAND "${smokeDirectory}/Smoke.cmd" ...)`, retaining its working directory, timeout, and captured diagnostics.
+- Preserve this direct invocation. Do not restore an explicit `cmd.exe /C` wrapper or refactor the validated invocation unless a future task requires it and Windows verification is performed.
+- A separate configuration typo, `CMAKE_BUILD_TYPE=Releas`, was corrected to `CMAKE_BUILD_TYPE=Release`.
+- After these corrections, the developer reported **26/26 Windows CTest tests passing**, and manually confirmed mounting from cmd.exe and ejecting the virtual CD.
+- Treat the committed implementation containing these fixes as the working baseline. These Windows results are developer-reported, not tests executed by the Linux agent.
+
