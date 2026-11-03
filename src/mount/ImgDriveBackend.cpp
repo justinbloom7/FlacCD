@@ -328,7 +328,7 @@ MountRecord ImgDriveBackend::prepare(char drive,
       storage = AudioStorage::Copy;
       files.copyCompressed(source, intent.audioPath, log);
    } else if (log) {
-      log("Staged FLAC hard link (no audio copy): " + pathToUtf8(intent.audioPath));
+      log("Staged FLAC hard link (no audio copy): " + pathToUtf8(source) + " -> " + pathToUtf8(intent.audioPath));
    }
    if (std::filesystem::file_size(intent.audioPath) != std::filesystem::file_size(source)) {
       throw std::runtime_error("staged FLAC has wrong size; incomplete resources retained, never mounted");

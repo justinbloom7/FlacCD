@@ -315,6 +315,9 @@ void testExisting(const std::filesystem::path& fixtures) {
 void testStaging(const std::filesystem::path& fixtures) {
    for (int variant = 0; variant < 3; ++variant) {
       Scenario s(fixtures);
+      // A caller's spelling need not match the canonical source passed to the
+      // filesystem operation (including Windows slash/extended-path forms).
+      s.source = s.source.parent_path() / "." / s.source.filename();
       if (variant == 0) {
          auto conflict = s.cue();
          conflict.replace(conflict.find("00:00:28"), 8, "00:00:29");
@@ -332,15 +335,22 @@ void testStaging(const std::filesystem::path& fixtures) {
       require(record.storage == (variant == 2 ? flaccd::AudioStorage::Copy : flaccd::AudioStorage::HardLink),
               "incorrect hard-link/copy preference");
       require(s.files.copyCalls == (variant == 2 ? 1 : 0), "unexpected compressed copy count");
+      require(std::filesystem::equivalent(s.source, record.sourcePath), "operation source differs from requested FLAC");
+      const auto hasOperationLog = [&](std::string_view prefix) {
+         return std::any_of(s.logs.begin(), s.logs.end(), [&](const auto& text) {
+            return text.starts_with(prefix) &&
+                   text.find(flaccd::pathToUtf8(record.sourcePath)) != std::string::npos &&
+                   text.find(" -> " + flaccd::pathToUtf8(record.audioPath)) != std::string::npos;
+         });
+      };
       if (variant != 2) {
          require(std::filesystem::equivalent(record.audioPath, s.source), "staged hard link is not original inode");
+         require(hasOperationLog("Staged FLAC hard link (no audio copy): "),
+                 "hard link was not accurately reported with source/destination");
+         require(!hasOperationLog("Copying compressed FLAC"), "hard link was incorrectly reported as an audio copy");
       } else {
          require(!std::filesystem::equivalent(record.audioPath, s.source), "copy unexpectedly aliases original");
-         require(std::any_of(s.logs.begin(), s.logs.end(), [&](const auto& text) {
-            return text.find("Copying compressed FLAC") != std::string::npos &&
-                   text.find(flaccd::pathToUtf8(s.source)) != std::string::npos &&
-                   text.find(flaccd::pathToUtf8(record.audioPath)) != std::string::npos;
-         }), "copy was not reported with source/destination");
+         require(hasOperationLog("Copying compressed FLAC"), "copy was not reported with source/destination");
       }
       verifyRecord(s, record);
       backend->unmount('D');
