@@ -29,6 +29,9 @@ class RestoreStore {
 public:
    explicit RestoreStore(std::filesystem::path cache);
    RestoreState read() const;
+   // Distinguishes a saved disabled preference from an unconfigured install.
+   // Call read() first so malformed published state still fails closed.
+   bool hasConfiguration() const;
    void save(const RestoreState& state);
    void remember(const MountRecord& record, std::string_view layout, bool noCopy, const std::string& session);
    void forget(const MountRecord& record);

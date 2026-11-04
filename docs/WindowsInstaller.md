@@ -115,9 +115,11 @@ maintenance: the installer is not a cross-process mount barrier. If another
 process reopens a binary, cancel/retry after closing it rather than ignoring a
 file-in-use error. Do not force a reboot-time replacement.
 
-Optional FlacCD login restoration remains disabled on a fresh install. If the
-user enabled it, `agent stop` suspends desired entries during the maintenance
-gap. After upgrading, `restore refresh` rearms only currently confirmed live
+FlacCD login restoration is enabled by default when no saved preference exists.
+Use `flaccd restore disable` to opt out; upgrades preserve this preference.
+Registration can precede ImgDrive installation; the login helper discovers
+ImgDrive with bounded retries. No ImgDrive driver is bundled. When enabled, `agent stop` suspends desired entries during the maintenance
+gap. After upgrading, `restore install-default` rearms only currently confirmed live
 mounts; missing/uncertain entries stay suspended. Uninstall runs `restore disable`
 before stopping the agent, removing only its owned HKCU startup value while
 retaining the desired list and backing resources. Custom cache configuration is
@@ -201,3 +203,10 @@ The packaging implementation follows Inno's
 [per-user privilege mode](https://jrsoftware.org/ishelp/topic_setup_privilegesrequired.htm),
 [pre-install hook](https://jrsoftware.org/ishelp/topic_scriptevents.htm), and
 [uninstall abort semantics](https://jrsoftware.org/ishelp/topic_isxfunc_abort.htm).
+
+Restoration default validation on Windows:
+
+1. In a new user profile, install and check `flaccd restore status`: enabled with an owned login registration. Mount an album, log out/in or reboot, and verify restoration.
+2. Run `flaccd restore disable`, upgrade, and verify it remains disabled with no login registration.
+3. Upgrade an enabled installation and verify its owned login command points to the installed EXE.
+4. Install without ImgDrive: installation succeeds; install ImgDrive later, mount a disc, and verify restoration on the next login.

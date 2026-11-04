@@ -11,7 +11,10 @@ std::wstring restoreStartupCommand(const std::wstring& executable,
                                    const std::wstring& cache,
                                    const std::wstring& imgDrive) {
    auto command = quoteWindowsArgument(executable) + L" restore run --startup --cache-dir " +
-                  quoteWindowsArgument(cache) + L" --imgdrive " + quoteWindowsArgument(imgDrive);
+                  quoteWindowsArgument(cache);
+   if (!imgDrive.empty()) {
+      command += L" --imgdrive " + quoteWindowsArgument(imgDrive);
+   }
    // Microsoft's documented Run value limit. Never silently truncate a path.
    if (command.size() > 260) {
       throw std::invalid_argument("login command exceeds Windows Run's 260-character limit; use shorter installation/cache paths");

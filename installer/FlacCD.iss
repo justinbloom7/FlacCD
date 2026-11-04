@@ -265,7 +265,8 @@ begin
          SuppressibleMsgBox(problem + ' Installation files are present; repair registration with flaccd shell install.',
                            mbError, MB_OK, IDOK);
       end;
-      problem := runFlacCD(ExpandConstant('{app}\flaccd.exe'), 'restore refresh');
+      { Enable unconfigured installations; preserve saved enable/disable choices. }
+      problem := runFlacCD(ExpandConstant('{app}\flaccd.exe'), 'restore install-default');
       if problem <> '' then begin
          registrationFailed := True;
          SuppressibleMsgBox(problem, mbError, MB_OK, IDOK);

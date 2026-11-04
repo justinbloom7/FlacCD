@@ -1250,6 +1250,14 @@ void testRestoration(const std::filesystem::path& fixtures) {
       expectError([&] { flaccd::restoreStartupCommand(std::wstring(261, L'x'), L"cache", L"imgdrive"); }, "260");
       Scenario s(fixtures);
       flaccd::RestoreStore desired(s.host.cache);
+      require(!desired.hasConfiguration(), "fresh installation already has a restoration preference");
+      require(flaccd::restoreStartupCommand(L"C:\\FlacCD\\flaccd.exe", L"C:\\Cache", L"").find(L"--imgdrive") ==
+                 std::wstring::npos, "installer pinned a nonexistent ImgDrive executable");
+      desired.save(flaccd::RestoreState{});
+      require(desired.hasConfiguration() && !desired.read().enabled,
+              "explicit disabled preference cannot be distinguished from a fresh installation");
+      flaccd::refreshRestoreStartup(startup, desired, L"C:\\FlacCD\\flaccd.exe", L"C:\\Cache", L"");
+      require(!desired.read().enabled && !startup.read(), "upgrade enabled an explicitly disabled installation");
       flaccd::RestoreState previous;
       previous.enabled = true;
       const auto oldCommand = flaccd::restoreStartupCommand(L"C:\\Build\\flaccd.exe", L"C:\\Cache", L"C:\\ImgDrive.exe");

@@ -562,12 +562,12 @@ Before a saved record can block mounting, FlacCD reconciles confirmed-empty
 devices against live ImgDrive state. Stale completed mounts can be cleaned and
 remounted on the first post-login request. Unknown/missing identities, pending
 vendor operations, occupied media and ownership changes preserve resources with
-diagnostics. Automatic login restoration is available as an explicit opt-in. See
+diagnostics. Automatic login restoration is enabled by the installer when no saved preference exists. See
 [MountRecovery.md](docs/MountRecovery.md) for recovery rules, crash consistency,
-vendor-documented ImgDrive automount options, the separate opt-in restoration
+vendor-documented ImgDrive automount options, the separate restoration
 implementation, and reboot/Windows validation steps.
 
-To enable it from CMD after installing this version:
+Check restoration status from CMD (or explicitly enable/rearm it):
 
 ```text
 "%LOCALAPPDATA%\Programs\FlacCD\flaccd.exe" restore enable
@@ -577,8 +577,8 @@ To enable it from CMD after installing this version:
 Enabling captures current confirmed mounts and remembers future successful
 mounts. At login a short-lived `flaccd restore run` helper retries readiness for
 up to 60 seconds and exits, using the existing agent for mount/eject monitoring.
-The default installer does not enable it, and no administrator privileges are
-needed for its HKCU startup registration. Disable ImgDrive's own automount when
+Installer upgrades preserve an explicit disabled preference. No administrator
+privileges are needed for its HKCU startup registration. Disable ImgDrive's own automount when
 using this mechanism so two restorers do not race.
 
 ```text

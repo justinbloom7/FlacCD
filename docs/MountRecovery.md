@@ -100,11 +100,13 @@ does not guarantee that the latest mount survives power loss or a hard reset.
 Retained CUE paths must still exist when restoration runs. A delayed ImgDrive
 automount could race FlacCD's confirmed-empty recovery, so test startup ordering
 before enabling it. FlacCD does not set ImgDrive's automount options or startup
-entries; its separate opt-in startup entry is described below.
+entries; its separate startup entry is described below.
 
-## Optional FlacCD login restoration — implemented, opt-in
+## FlacCD login restoration
 
-Enable from the permanently installed copy, as the normal Windows user:
+The installer enables restoration when no saved preference exists and preserves
+an explicit disable on upgrades. Portable builds require explicit enable. Check
+or rearm from the permanently installed copy, as the normal Windows user:
 
 ```text
 "%LOCALAPPDATA%\Programs\FlacCD\flaccd.exe" restore enable
@@ -115,8 +117,8 @@ Enable from the permanently installed copy, as the normal Windows user:
 mounts, including layout choice, source path, device identity and copy policy.
 For old mounts it chooses a matching layout and conservatively forbids a new
 compressed copy unless that mount already used one. Reissuing enable is an
-explicit rearm decision for suspended entries. No login entry is installed by
-default. Disable ImgDrive's own automount before using FlacCD restoration.
+explicit rearm decision for suspended entries. The installer creates the per-user login entry by default;
+`restore disable` removes it. Disable ImgDrive's own automount before using FlacCD restoration.
 
 Other commands (run from the installed directory, or use its full EXE path):
 
@@ -200,7 +202,7 @@ ejects while monitoring is stopped cannot be reliably observed. It retains all
 active media, state and backing files. `restore enable` explicitly rearms; an
 installer upgrade rearms only mounts that are still confirmed live after its
 maintenance gap. Uninstall disables the owned startup registration and retains
-the data. A fresh installation never opts the user in automatically.
+the data. A fresh installation enables restoration; saved disabled preferences are preserved.
 Installer maintenance also pauses/drains an existing login helper before file
 replacement. Suspension is checked again before an agent is started, so a
 draining helper cannot automatically restart an agent that was just stopped.
@@ -215,7 +217,7 @@ logins for the same user remain outside the existing single per-user agent model
 
 An external eject immediately followed by a hard reset before the agent observes
 it is fundamentally ambiguous: no persisted intent can prove that missed event.
-The opt-in list may still request restoration in that case. Wait for confirmed
+The desired list may still request restoration in that case. Wait for confirmed
 eject cleanup before reboot when that intent matters. Explicit `flaccd unmount`
 records cancellation first. Ordinary monitored ejects and graceful-stop gaps
 have the conservative behavior above.
@@ -243,7 +245,7 @@ ctest --test-dir build-windows --output-on-failure
 cmake --build build-windows --target flaccd-installer
 ```
 
-1. Verify a fresh install has `restore status` disabled and no `FlacCD.Restore`
+1. Verify a fresh install has `restore status` enabled and an owned `FlacCD.Restore`
    Run value. Existing Explorer mount/eject, shell registration and smoke tests
    must keep working. The native startup test uses an isolated HKCU fixture,
    never the real Run key, and checks unrelated values remain unchanged.

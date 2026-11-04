@@ -24,7 +24,7 @@ AgentReply runWindowsRestore(const std::vector<std::string>& arguments) {
    }
    const auto& action = arguments[1];
    if (action != "enable" && action != "disable" && action != "status" && action != "run" &&
-       action != "forget" && action != "refresh" && action != "pause") {
+       action != "forget" && action != "refresh" && action != "install-default" && action != "pause") {
       throw std::invalid_argument("unknown restore action");
    }
    AgentClientSettings settings;
@@ -82,10 +82,10 @@ AgentReply runWindowsRestore(const std::vector<std::string>& arguments) {
          auto values = CommandLineToArgvW(startupCommand->c_str(), &count);
          std::unique_ptr<wchar_t*, decltype(&LocalFree)> valuesOwner(values, &LocalFree);
          if (values) {
-            if (count == 8 &&
+            if ((count == 6 || count == 8) &&
                 std::wstring_view(values[1]) == L"restore" && std::wstring_view(values[2]) == L"run" &&
                 std::wstring_view(values[3]) == L"--startup" && std::wstring_view(values[4]) == L"--cache-dir" &&
-                std::wstring_view(values[6]) == L"--imgdrive") {
+                (count == 6 || std::wstring_view(values[6]) == L"--imgdrive")) {
                const auto candidateCache = std::filesystem::path(values[5]);
                bool owned = candidateCache.is_absolute() && _wcsicmp(values[0], shellExecutablePath().c_str()) == 0;
                if (!owned && candidateCache.is_absolute()) {
@@ -95,7 +95,7 @@ AgentReply runWindowsRestore(const std::vector<std::string>& arguments) {
                }
                if (owned) {
                   settings.cache = candidateCache;
-                  if (!seen.contains("--imgdrive")) {
+                  if (count == 8 && !seen.contains("--imgdrive")) {
                      settings.imgDrive = values[7];
                   }
                }
@@ -153,11 +153,10 @@ AgentReply runWindowsRestore(const std::vector<std::string>& arguments) {
          reply.output = "Restore intent removed for the specified path; active media untouched.\n";
          return reply;
       }
-      if (action == "refresh") {
+      // A saved disabled preference survives upgrades. Only unconfigured
+      // installations adopt the installer's default.
+      if (action == "refresh" || (action == "install-default" && store.hasConfiguration())) {
          if (state.enabled) {
-            if (settings.imgDrive.empty()) {
-               settings.imgDrive = std::filesystem::absolute(findImgDrive());
-            }
             refreshRestoreStartup(registration, store, shellExecutablePath(), settings.cache.wstring(), settings.imgDrive.wstring());
             captureDesiredMounts(host, settings.cache, store, false);
          }
@@ -175,9 +174,13 @@ AgentReply runWindowsRestore(const std::vector<std::string>& arguments) {
          reply.output = "Automatic login restoration disabled; desired list/resources retained.\n";
          return reply;
       }
-      settings.imgDrive = std::filesystem::absolute(findImgDrive(settings.imgDrive));
-      if (!std::filesystem::is_regular_file(settings.imgDrive)) {
-         throw std::runtime_error("ImgDrive executable unavailable; restoration was not enabled");
+      // Installer registration may precede installation of ImgDrive. An
+      // unpinned login command uses the helper's bounded discovery retries.
+      if (action != "install-default" || !settings.imgDrive.empty()) {
+         settings.imgDrive = std::filesystem::absolute(findImgDrive(settings.imgDrive));
+         if (!std::filesystem::is_regular_file(settings.imgDrive)) {
+            throw std::runtime_error("ImgDrive executable unavailable; restoration was not enabled");
+         }
       }
       const auto command = restoreStartupCommand(shellExecutablePath(), settings.cache.wstring(), settings.imgDrive.wstring());
       state.enabled = true;

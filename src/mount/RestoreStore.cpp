@@ -66,6 +66,10 @@ void validate(const RestoreState& state) {
 RestoreStore::RestoreStore(std::filesystem::path cache) : root(std::move(cache) / "restore") {
 }
 
+bool RestoreStore::hasConfiguration() const {
+   return !snapshots(root).empty();
+}
+
 RestoreState RestoreStore::read() const {
    const auto files = snapshots(root);
    RestoreState state;

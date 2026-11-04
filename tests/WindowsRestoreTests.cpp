@@ -4,6 +4,7 @@
 #include "flaccd/PathText.h"
 
 #include <windows.h>
+#include <shellapi.h>
 
 #include <iostream>
 #include <stdexcept>
@@ -71,6 +72,20 @@ int wmain() {
       flaccd::updateRestoreStartup(startup, command, {});
       flaccd::updateRestoreStartup(startup, command, {});
       require(!startup.read(), "Native startup removal/idempotence");
+      const auto discoveredCommand = flaccd::restoreStartupCommand(L"C:\\Program \u97f3 & %\\flaccd.exe",
+                                                                  L"C:\\Cache !", L"");
+      int argumentCount = 0;
+      auto arguments = CommandLineToArgvW(discoveredCommand.c_str(), &argumentCount);
+      const bool valid = arguments && argumentCount == 6 &&
+                         std::wstring(arguments[0]) == L"C:\\Program \u97f3 & %\\flaccd.exe" &&
+                         std::wstring(arguments[5]) == L"C:\\Cache !";
+      if (arguments) {
+         LocalFree(arguments);
+      }
+      require(valid, "Installer startup command without a pinned ImgDrive path did not round trip");
+      flaccd::updateRestoreStartup(startup, L"", discoveredCommand);
+      require(startup.read() == discoveredCommand, "Unpinned installer startup registration round trip");
+      flaccd::updateRestoreStartup(startup, discoveredCommand, {});
       fixture.ownsCache = std::filesystem::create_directory(fixture.cache);
       require(fixture.ownsCache, "Migration test cache already exists; preserved");
       flaccd::RestoreStore desired(fixture.cache);
