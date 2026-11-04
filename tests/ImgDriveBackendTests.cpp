@@ -20,7 +20,9 @@
 #include <random>
 #include <sstream>
 #include <set>
+#include <source_location>
 #include <thread>
+#include <typeinfo>
 
 namespace {
 
@@ -31,12 +33,23 @@ void require(bool condition, std::string_view message) {
 }
 
 template<typename Operation>
-void expectError(Operation operation, std::string_view expected = {}) {
+void expectError(Operation operation,
+                 std::string_view expected = {},
+                 const std::source_location& location = std::source_location::current()) {
    try {
       operation();
    } catch (const std::exception& error) {
-      require(std::string_view(error.what()).find(expected) != std::string_view::npos,
-              std::string("unexpected diagnostic: ") + error.what());
+      if (std::string_view(error.what()).find(expected) == std::string_view::npos) {
+         std::ostringstream diagnostic;
+         diagnostic << location.file_name() << ':' << location.line() << " in " << location.function_name()
+                    << "\nExpected diagnostic containing: " << std::quoted(std::string(expected))
+                    << "\nActual diagnostic: " << std::quoted(error.what())
+                    << "\nException type: " << typeid(error).name();
+         if (const auto* systemError = dynamic_cast<const std::system_error*>(&error)) {
+            diagnostic << "\nError code: " << systemError->code().category().name() << ':' << systemError->code().value();
+         }
+         throw std::runtime_error(diagnostic.str());
+      }
       return;
    }
    throw std::runtime_error("expected operation to fail");
@@ -450,7 +463,20 @@ void testNoCopyAndErrors(const std::filesystem::path& fixtures) {
    expectError([&] { backend->mount(s.source, 'D', "auto", {}, true); }, "--no-copy");
    require(s.files.copyCalls == 0 && s.host.calls.empty() && backend->status().empty(), "--no-copy copied or mounted");
    s.files.linkError = std::make_error_code(std::errc::io_error);
-   expectError([&] { backend->mount(s.source, 'D'); }, "hard link");
+   expectError([&] {
+      try {
+         backend->mount(s.source, 'D');
+      } catch (const std::system_error& error) {
+         require(error.code() == s.files.linkError, "hard-link diagnostic lost original error code/category");
+         const auto pending = backend->status();
+         require(pending.size() == 1, "hard-link failure lost recoverable preparation state");
+         const std::string_view diagnostic(error.what());
+         require(diagnostic.find(flaccd::pathToUtf8(std::filesystem::canonical(s.source))) != std::string_view::npos &&
+                 diagnostic.find(flaccd::pathToUtf8(pending[0].record.audioPath)) != std::string_view::npos,
+                 "hard-link diagnostic lost Unicode source/destination paths");
+         throw;
+      }
+   }, "hard link");
    require(s.files.copyCalls == 0 && s.host.calls.empty(), "unexpected hard-link failure was hidden by copying");
    s.unchanged();
    Scenario failed(fixtures);

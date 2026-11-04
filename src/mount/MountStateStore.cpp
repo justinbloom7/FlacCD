@@ -55,7 +55,7 @@ void writeMetadata(const std::filesystem::path& path,
    const auto temporary = temporaryDirectory / (".pending-" + makeId());
    const auto error = files.createCueExclusive(temporary, text);
    if (error) {
-      throw std::filesystem::filesystem_error("exclusive mount metadata creation", path, error);
+      throw std::system_error(error, "exclusive mount metadata creation: " + pathToUtf8(path));
    }
    publishMountMetadata(temporary, path);
 }

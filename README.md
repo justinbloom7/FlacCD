@@ -7,6 +7,11 @@ it does not decode audio or mount a drive. `flaccd-export` uses the core CDDA
 reader for full-disc, track, range, split-track, and BIN/CUE exports. No custom
 Windows driver is built or installed.
 
+To build the complete Windows application on CentOS Stream 9, see
+[WindowsCrossCompilation.md](docs/WindowsCrossCompilation.md). The guide uses a
+pinned LLVM-MinGW UCRT toolchain and static libFLAC, with Linux-side deployment
+audits and Windows-side test/installer steps.
+
 ## Installing on Windows
 
 End users need Windows 10/11 **x64** and a separately installed, working

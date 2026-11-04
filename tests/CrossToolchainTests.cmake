@@ -1,0 +1,66 @@
+cmake_minimum_required(VERSION 3.20)
+set(FLACCD_LLVM_MINGW_ROOT "${testDirectory}/Toolchain with spaces")
+set(FLACCD_WINDOWS_DEPENDENCY_PREFIX "${testDirectory}/Target dependencies")
+file(MAKE_DIRECTORY "${FLACCD_LLVM_MINGW_ROOT}/bin")
+foreach(tool clang clang++ windres)
+   file(WRITE "${FLACCD_LLVM_MINGW_ROOT}/bin/x86_64-w64-mingw32-${tool}" "fixture; not executed")
+endforeach()
+# This tests discovery isolation without requiring a downloaded cross compiler.
+set(FLACCD_WINDOWS_OBJDUMP "${CMAKE_COMMAND}")
+set(ENV{PKG_CONFIG_PATH} "/unrelated/host/packages")
+set(ENV{PKG_CONFIG_LIBDIR} "/usr/lib64/pkgconfig")
+set(ENV{PKG_CONFIG_SYSROOT_DIR} "/host/sysroot")
+include("${sourceRoot}/cmake/toolchains/LlvmMingwUcrt.cmake")
+if(NOT "$ENV{PKG_CONFIG_PATH}" STREQUAL "" OR
+   NOT "$ENV{PKG_CONFIG_SYSROOT_DIR}" STREQUAL "" OR
+   NOT "$ENV{PKG_CONFIG_LIBDIR}" STREQUAL "${FLACCD_WINDOWS_DEPENDENCY_PREFIX}/lib/pkgconfig")
+   message(FATAL_ERROR "Cross pkg-config discovery retained host directories")
+endif()
+foreach(kind LIBRARY INCLUDE PACKAGE)
+   if(NOT CMAKE_FIND_ROOT_PATH_MODE_${kind} STREQUAL "ONLY")
+      message(FATAL_ERROR "Cross ${kind} discovery can escape target roots")
+   endif()
+endforeach()
+if(NOT CMAKE_FIND_ROOT_PATH_MODE_PROGRAM STREQUAL "NEVER" OR
+   NOT CMAKE_CXX_COMPILER STREQUAL "${FLACCD_LLVM_MINGW_ROOT}/bin/x86_64-w64-mingw32-clang++" OR
+   NOT CMAKE_SYSTEM_NAME STREQUAL "Windows" OR NOT CMAKE_SYSTEM_PROCESSOR STREQUAL "x86_64")
+   message(FATAL_ERROR "Incorrect host-tool or target compiler selection")
+endif()
+foreach(variable FLACCD_LLVM_MINGW_ROOT FLACCD_WINDOWS_DEPENDENCY_PREFIX FLACCD_WINDOWS_OBJDUMP)
+   if(NOT variable IN_LIST CMAKE_TRY_COMPILE_PLATFORM_VARIABLES)
+      message(FATAL_ERROR "Link probes lose cross setting ${variable}")
+   endif()
+endforeach()
+file(WRITE "${FLACCD_LLVM_MINGW_ROOT}/bin/clang" "host compiler fingerprint fixture")
+file(SHA256 "${FLACCD_LLVM_MINGW_ROOT}/bin/clang" compilerHash)
+file(MAKE_DIRECTORY "${FLACCD_WINDOWS_DEPENDENCY_PREFIX}")
+set(stamp "${FLACCD_WINDOWS_DEPENDENCY_PREFIX}/FlacCDToolchain.txt")
+file(WRITE "${stamp}" "${FLACCD_LLVM_MINGW_ROOT}\n${compilerHash}\n")
+file(WRITE "${testDirectory}/CheckPrefix.cmake" [=[
+cmake_minimum_required(VERSION 3.20)
+# The real x64/UCRT compile/link probe is exercised by the actual cross build.
+# This script tests only provenance and directory isolation, without a compiler.
+set(FLACCD_WINDOWS_UCRT_X64 TRUE)
+include("${sourceRoot}/cmake/CheckCrossEnvironment.cmake")
+set(FLAC_INCLUDE_DIRS "${candidateDirectory}")
+checkCrossFlacDirectories()
+]=])
+function(checkPrefix candidate expected)
+   execute_process(COMMAND "${CMAKE_COMMAND}"
+      "-DsourceRoot=${sourceRoot}" "-DFLACCD_LLVM_MINGW_ROOT=${FLACCD_LLVM_MINGW_ROOT}"
+      "-DFLACCD_WINDOWS_DEPENDENCY_PREFIX=${FLACCD_WINDOWS_DEPENDENCY_PREFIX}"
+      "-DcandidateDirectory=${candidate}" -P "${testDirectory}/CheckPrefix.cmake"
+      RESULT_VARIABLE result OUTPUT_VARIABLE output ERROR_VARIABLE error)
+   if(expected STREQUAL "success")
+      if(NOT result EQUAL 0)
+         message(FATAL_ERROR "Valid dependency provenance rejected: ${output}${error}")
+      endif()
+   elseif(result EQUAL 0 OR NOT "${output}${error}" MATCHES "${expected}")
+      message(FATAL_ERROR "Expected ${expected}; got ${result}: ${output}${error}")
+   endif()
+endfunction()
+checkPrefix("${FLACCD_WINDOWS_DEPENDENCY_PREFIX}" success)
+checkPrefix("${sourceRoot}" "escaped the Windows dependency prefix")
+file(WRITE "${stamp}" "another toolchain")
+checkPrefix("${FLACCD_WINDOWS_DEPENDENCY_PREFIX}" "belongs to another toolchain")
+message(STATUS "Target discovery isolation and cross probe settings passed")

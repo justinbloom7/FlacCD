@@ -1,0 +1,35 @@
+if(NOT FLACCD_WINDOWS_DEPENDENCY_PREFIX OR NOT IS_ABSOLUTE "${FLACCD_WINDOWS_DEPENDENCY_PREFIX}")
+   message(FATAL_ERROR "Cross builds require an isolated FLACCD_WINDOWS_DEPENDENCY_PREFIX; see docs/WindowsCrossCompilation.md")
+endif()
+if(FLACCD_LLVM_MINGW_ROOT)
+   set(stamp "${FLACCD_WINDOWS_DEPENDENCY_PREFIX}/FlacCDToolchain.txt")
+   if(NOT EXISTS "${stamp}")
+      message(FATAL_ERROR "Build dependencies/windows first; this prefix has no LLVM-MinGW provenance record")
+   endif()
+   file(SHA256 "${FLACCD_LLVM_MINGW_ROOT}/bin/clang" compilerHash)
+   file(READ "${stamp}" recorded)
+   if(NOT recorded STREQUAL "${FLACCD_LLVM_MINGW_ROOT}\n${compilerHash}\n")
+      message(FATAL_ERROR "Windows dependency prefix belongs to another toolchain; rebuild dependencies into a new prefix")
+   endif()
+endif()
+include(CheckCXXSourceCompiles)
+check_cxx_source_compiles("#include <_mingw.h>
+#ifndef _UCRT
+#error Windows dependencies and application must target UCRT
+#endif
+static_assert(sizeof(void*) == 8);
+int main() { return 0; }" FLACCD_WINDOWS_UCRT_X64)
+if(NOT FLACCD_WINDOWS_UCRT_X64)
+   message(FATAL_ERROR "The cross compiler must target Windows x64 UCRT")
+endif()
+
+function(checkCrossFlacDirectories)
+   file(REAL_PATH "${FLACCD_WINDOWS_DEPENDENCY_PREFIX}" prefix)
+   foreach(directory IN LISTS FLAC_INCLUDE_DIRS FLAC_LIBRARY_DIRS FLAC_STATIC_LIBRARY_DIRS)
+      file(REAL_PATH "${directory}" actual)
+      cmake_path(IS_PREFIX prefix "${actual}" NORMALIZE withinPrefix)
+      if(NOT withinPrefix)
+         message(FATAL_ERROR "FLAC pkg-config escaped the Windows dependency prefix: ${directory}")
+      endif()
+   endforeach()
+endfunction()

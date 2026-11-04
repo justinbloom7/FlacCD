@@ -12,7 +12,7 @@ inline std::string pathToUtf8(const std::filesystem::path& path) {
 }
 
 inline std::filesystem::path pathFromUtf8(std::string_view text) {
-   return std::filesystem::u8path(text.begin(), text.end());
+   return std::filesystem::path(std::u8string(text.begin(), text.end()));
 }
 
 }

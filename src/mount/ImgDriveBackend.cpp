@@ -331,7 +331,7 @@ MountRecord ImgDriveBackend::prepare(char drive,
             return *existing;
          }
       } else if (!expectedLinkFailure(error)) {
-         throw std::filesystem::filesystem_error("create adjacent CUE", adjacent, error);
+         throw std::system_error(error, "create adjacent CUE: " + pathToUtf8(adjacent));
       } else if (log) {
          log("Cannot create adjacent CUE; using isolated staging: " + error.message());
       }
@@ -341,7 +341,10 @@ MountRecord ImgDriveBackend::prepare(char drive,
    const auto error = files.hardLink(source, intent.audioPath);
    if (error) {
       if (!expectedLinkFailure(error)) {
-         throw std::filesystem::filesystem_error("stage FLAC hard link", source, intent.audioPath, error);
+         // Format Unicode paths explicitly: libc++'s Windows filesystem_error
+         // formatting can throw length_error and mask the original I/O error.
+         throw std::system_error(error, "stage FLAC hard link: " + pathToUtf8(source) +
+                                          " -> " + pathToUtf8(intent.audioPath));
       }
       if (noCopy) {
          store.discardEmptyPreparation(intent);

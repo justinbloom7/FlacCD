@@ -1,5 +1,8 @@
 cmake_minimum_required(VERSION 3.20)
 project(FlacCD VERSION 0.1.0 LANGUAGES CXX)
+if(CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_NAME STREQUAL "Windows")
+   include(cmake/CheckCrossEnvironment.cmake)
+endif()
 include(cmake/ProductMetadata.cmake)
 if(WIN32)
    enable_language(RC)
@@ -11,6 +14,9 @@ endif()
 
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(FLAC REQUIRED IMPORTED_TARGET flac>=1.3.3)
+if(CMAKE_CROSSCOMPILING AND CMAKE_SYSTEM_NAME STREQUAL "Windows")
+   checkCrossFlacDirectories()
+endif()
 include(cmake/FlacDependency.cmake)
 configureFlacDependency()
 
@@ -99,6 +105,12 @@ if(BUILD_TESTING)
       "-DsourceRoot=${PROJECT_SOURCE_DIR}"
       "-DtestDirectory=${CMAKE_CURRENT_BINARY_DIR}/installer-fixtures"
       -P "${PROJECT_SOURCE_DIR}/tests/InstallerPayloadTests.cmake")
+   set_tests_properties(installer-payload PROPERTIES LABELS host)
+   add_test(NAME cross-toolchain COMMAND "${CMAKE_COMMAND}"
+      "-DsourceRoot=${PROJECT_SOURCE_DIR}"
+      "-DtestDirectory=${CMAKE_CURRENT_BINARY_DIR}/toolchain-fixtures"
+      -P "${PROJECT_SOURCE_DIR}/tests/CrossToolchainTests.cmake")
+   set_tests_properties(cross-toolchain PROPERTIES LABELS host)
    add_executable(flaccd-shell-tests tests/ShellRegistrationTests.cpp)
    target_link_libraries(flaccd-shell-tests PRIVATE flaccd-mount)
    set_target_properties(flaccd-shell-tests PROPERTIES CXX_EXTENSIONS OFF)
@@ -140,8 +152,12 @@ if(BUILD_TESTING)
    set_target_properties(flaccd-process-diagnostic-tests PROPERTIES CXX_EXTENSIONS OFF)
    add_test(NAME process-argument-diagnostics COMMAND flaccd-process-diagnostic-tests)
    if(WIN32)
+      set(windowsPowerShell "$ENV{SystemRoot}/System32/WindowsPowerShell/v1.0/powershell.exe")
+      if(CMAKE_CROSSCOMPILING)
+         set(windowsPowerShell powershell.exe)
+      endif()
       add_test(NAME windows-version-metadata
-         COMMAND "$ENV{SystemRoot}/System32/WindowsPowerShell/v1.0/powershell.exe"
+         COMMAND "${windowsPowerShell}"
             -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass
             -File "${PROJECT_SOURCE_DIR}/tests/WindowsVersionTests.ps1"
             -Directory "$<TARGET_FILE_DIR:flaccd>" -Publisher "${FLACCD_PUBLISHER}"
@@ -242,7 +258,9 @@ if(BUILD_TESTING)
       "-DfixtureDirectory=${CMAKE_CURRENT_BINARY_DIR}/cdda-fixtures"
       -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/CddaExportTests.cmake")
    set_tests_properties(cdda-export PROPERTIES FIXTURES_REQUIRED cddaFixtures)
-   find_program(FLAC_REFERENCE_TOOL NAMES flac)
+   if(NOT CMAKE_CROSSCOMPILING)
+      find_program(FLAC_REFERENCE_TOOL NAMES flac)
+   endif()
    if(FLAC_REFERENCE_TOOL)
       add_test(NAME cdda-reference COMMAND "${CMAKE_COMMAND}"
          "-DexportTool=$<TARGET_FILE:flaccd-export>"
