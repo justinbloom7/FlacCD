@@ -14,12 +14,64 @@ cmake --build build-windows --target flaccd-smoke flaccd-package
 The existing 26 Windows tests remain registered. Two additional tests are
 `shell-registration` (portable policy/quoting with a registry mock) and
 `windows-shell-registration` (native HKCU lifecycle and ShellExecute argument
-round trips). The native test creates an isolated `HKCU\Software\FlacCD\ShellTests`
-namespace; it does **not** install the Explorer verb or change file associations.
+round trips). The native test creates an exclusively owned, unique ProgID under
+`HKCU\Software\Classes\FlacCD.ShellTests.<unique ID>` and selects it explicitly
+with `SEE_MASK_CLASSNAME`/`lpClass`. It does **not** associate that ProgID with an
+extension, install the real Explorer verb, or change `.flac`, UserChoice, or
+SystemFileAssociations. Cleanup removes only the newly created test key.
 A harmless probe receives `mount` and the selected filename, records UTF-16
 arguments, and exits. It never contacts ImgDrive or the agent. It tests executable
 folders and filenames containing spaces, Unicode, shell metacharacters, literal
 `%1`, `%L`, `%PATH%`, and `%%`. No shell interprets `&`, `^`, `!`, or parentheses.
+
+### Isolated ShellExecute scope and diagnostics
+
+The earlier fixture passed a generic key outside `Software\Classes` through
+`SEE_MASK_CLASSKEY`. Its combined failure assertion did not establish whether
+class lookup failed or a process handle was missing. The replacement uses a
+genuine, unassociated test ProgID visible through
+HKCR and explicitly verifies that the merged class command equals the command
+written by the production registration implementation before launching it.
+[Microsoft documents](https://learn.microsoft.com/en-us/windows/win32/api/shellapi/ns-shellapi-shellexecuteinfow)
+`lpClass` selection of a ProgID or a shell-verb key under HKCR.
+
+The old assertion also combined FALSE return and missing `hProcess`, reporting
+`GetLastError()` for both. Success does not make that last-error value meaningful,
+and ShellExecute can legitimately succeed without returning a process handle.
+The updated test reports those cases separately. It still requires a new process
+because this test's fresh static command has no DDE or delegate. Launch failures
+include numeric/hex error values, system text, ProgID, registry root, verb, file,
+registered command, hInstApp and process-handle presence. Probe exit, wait, output
+and argument mismatches have separate diagnostics, including escaped expected
+and actual UTF-16 bytes for a mismatch.
+
+This validates native command lookup/expansion, argument delivery and registry
+lifecycle; it does not validate the Explorer menu UI, the user's actual FLAC
+association, or ImgDrive mounting/ejecting. Those remain manual integration
+checks. The old combined assertion cannot establish whether Windows returned
+FALSE or TRUE without a handle, so the precise original internal failure path
+cannot be reconstructed from that message alone. The new diagnostics preserve
+that distinction if a native launch still fails.
+
+Subsequent Windows results established a different, production command-building
+defect: the normal-path case passed, but the executable folder containing literal
+percent signs failed with `2147746293` (`0x800401F5`, `CO_E_APPNOTFOUND`, Application
+not found). The command had doubled executable-path percent signs, so it named a
+different executable. The executable token is now quoted with its percent signs
+unchanged; only the argument-list `"%1"` is the selected-file placeholder. This
+is a direct REG_SZ command, not a batch file. The native percent-containing
+round-trip case remains unchanged. Old doubled-percent registrations are
+recognized by their complete expected values and repaired by `shell install`;
+edited/foreign registrations remain protected. The corrected native test still
+requires execution on Windows before claiming the fix verified there.
+
+Run on Windows:
+
+```bash
+cmake --build build-windows
+ctest --test-dir build-windows -R '^windows-shell-registration$' --output-on-failure
+ctest --test-dir build-windows --output-on-failure
+```
 
 ## Manual Explorer checks
 
@@ -30,7 +82,7 @@ folders and filenames containing spaces, Unicode, shell metacharacters, literal
    `HKCU\Software\Classes\SystemFileAssociations\.flac\shell\FlacCD.MountAudioCD`.
    The label is **Mount as Audio CD**; `MultiSelectModel` is `Single`. The command
    is `"<absolute flaccd.exe path>" mount "%1" --explorer`. Literal percent signs in the
-   executable path are doubled for the ShellExecute command template. Values
+   executable path remain unchanged. Values
    use Unicode `REG_SZ`, not environment-expanding `REG_EXPAND_SZ`.
 3. Right-click a known-good FLAC album, such as your actual Zelda.flac path.
    Use **Show more options** on Windows 11. Confirm the audio CD and expected

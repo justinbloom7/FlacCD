@@ -28,5 +28,7 @@ public:
 std::string readMountCue(const std::filesystem::path& path);
 bool mountPathExists(const std::filesystem::path& path);
 bool expectedLinkFailure(const std::error_code& error);
+// Same-filesystem atomic publication, used only while holding the cache lock.
+void publishMountMetadata(const std::filesystem::path& temporary, const std::filesystem::path& destination);
 
 }

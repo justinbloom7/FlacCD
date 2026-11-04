@@ -1,5 +1,6 @@
 #include "flaccd/mount/MountAgent.h"
 #include "flaccd/mount/AgentCommand.h"
+#include "flaccd/mount/RestoreCoordinator.h"
 #include "flaccd/PathText.h"
 
 #include <charconv>
@@ -47,7 +48,12 @@ AgentReply MountAgent::handle(const std::vector<std::string>& request) {
       }
       std::lock_guard guard(mutex);
       if (stopTimeout) {
-         reply.output = "Agent shutdown requested; mounts/state retained; eject monitoring will pause.\n";
+         auto stateLock = host.lock(cache, *stopTimeout);
+         if (!stateLock) {
+            throw std::runtime_error("cannot suspend restoration before agent shutdown");
+         }
+         RestoreStore(cache).suspend();
+         reply.output = "Agent shutdown requested; mounts/state retained; restore entries suspended; eject monitoring will pause.\n";
          return reply;
       }
       if (stopping.load()) {
@@ -59,7 +65,8 @@ AgentReply MountAgent::handle(const std::vector<std::string>& request) {
          throw std::invalid_argument("missing command");
       }
       const auto& command = arguments[0];
-      if (command != "mount" && command != "unmount" && command != "status" && command != "drives" && command != "agent-stop") {
+      if (command != "mount" && command != "unmount" && command != "status" && command != "drives" && command != "agent-stop" &&
+          command != "restore-step") {
          throw std::invalid_argument("unknown command");
       }
       std::size_t position = 1;
@@ -124,14 +131,29 @@ AgentReply MountAgent::handle(const std::vector<std::string>& request) {
          if (reply.diagnostics.size() < 65536) {
             reply.diagnostics += text.substr(0, 65536 - reply.diagnostics.size()) + "\n";
          }
+      }, [&](const MountRecord& record) {
+         RestoreStore(cache).observedDetach(record, host.sessionIdentity());
       });
+      if (command == "restore-step") {
+         RestoreStore desired(cache);
+         return restoreStep(host, backend, desired);
+      }
       if (command == "mount") {
          const auto record = backend.mount(source, drive, layout, {}, noCopy);
+         RestoreStore(cache).remember(record, layout, noCopy, host.sessionIdentity());
          reply.output = "Mounted on " + std::string(1, record.actualDrive) + ":\nCUE: " + pathToUtf8(record.cuePath) + "\n";
       } else if (command == "unmount") {
+         for (const auto& status : backend.status()) {
+            if (status.record.actualDrive == *drive) {
+               RestoreStore(cache).forget(status.record);
+            }
+         }
          reply.output = backend.unmount(*drive);
       } else if (command == "drives") {
+         reply.diagnostics += backend.reconcileMissingMounts();
          reply.output = backend.drives();
+      } else if (command == "status") {
+         reply.diagnostics += backend.reconcileMissingMounts();
       }
       const auto statuses = backend.status();
       for (const auto& status : statuses) {
@@ -143,8 +165,8 @@ AgentReply MountAgent::handle(const std::vector<std::string>& request) {
                                   mountStrategyName(record), pathToUtf8(record.sourcePath), pathToUtf8(record.cuePath),
                                   pathToUtf8(record.audioPath), media, record.imgDriveSelector});
          if (command == "status") {
-            reply.output += "Requested " + requested + ": actual " + actual + ": " + mountStateName(record.state) +
-                            " " + media + " identity=" + record.deviceIdentity + " selector=" + record.imgDriveSelector + "\n  " + mountStrategyName(record) +
+            reply.output += "Requested " + requested + ": actual " + actual + ": saved-phase=" + mountStateName(record.state) +
+                            " live-media=" + media + " identity=" + record.deviceIdentity + " selector=" + record.imgDriveSelector + "\n  " + mountStrategyName(record) +
                             "\n  FLAC: " + pathToUtf8(record.sourcePath) + "\n  CUE: " + pathToUtf8(record.cuePath) + "\n";
          }
       }
@@ -172,7 +194,10 @@ std::string MountAgent::reconcile(std::chrono::steady_clock::time_point now) {
       return result;
    }
    try {
-      ImgDriveBackend backend(host, executable, cache);
+      ImgDriveBackend backend(host, executable, cache, std::chrono::seconds(30), nullptr, {},
+                               [&](const MountRecord& record) {
+                                  RestoreStore(cache).observedDetach(record, host.sessionIdentity());
+                               });
       std::set<std::string> active;
       const auto drives = host.opticalDrives();
       for (const auto& status : backend.status()) {
@@ -182,7 +207,8 @@ std::string MountAgent::reconcile(std::chrono::steady_clock::time_point now) {
          // An unmounting marker records intent, not successful vendor execution.
          // A failed/uncertain unmount must remain available for explicit retry.
          const bool confirmed = record.deviceConfirmed &&
-                                (record.state == MountState::Mounted || record.state == MountState::Detached);
+                                (record.state == MountState::Mounted || record.state == MountState::Detached ||
+                                 record.state == MountState::Unmounting);
          if (!confirmed || !actual || !actual->imgDrive || actual->media != MediaState::Empty) {
             emptySince.erase(record.id);
             continue;
@@ -192,7 +218,7 @@ std::string MountAgent::reconcile(std::chrono::steady_clock::time_point now) {
          // observations at least five seconds apart debounce transient readiness.
          if (!inserted && now - entry->second >= std::chrono::seconds(5)) {
             try {
-               result += backend.cleanupEjected(record);
+               result += backend.cleanupEjected(record, true);
                emptySince.erase(record.id);
             } catch (const std::exception& error) {
                result += std::string("Eject cleanup deferred: ") + error.what() + "\n";

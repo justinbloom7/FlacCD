@@ -58,3 +58,6 @@ if(NOT installer MATCHES "AppId=\\{\\{70A8B7A2-BE27-4D88-9566-76E87C57F284\\}" O
    installer MATCHES "\\[UninstallDelete\\]|\\[Registry\\]")
    message(FATAL_ERROR "Installer lost its stable in-place upgrade/CLI registry contract")
 endif()
+if(NOT installer MATCHES "'restore install-default'")
+   message(FATAL_ERROR "Installer does not apply the preference-preserving restoration default")
+endif()

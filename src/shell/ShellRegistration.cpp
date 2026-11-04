@@ -17,16 +17,9 @@ std::wstring shellMountCommand(std::wstring_view executable) {
        executable.find(L'\0') != std::wstring_view::npos || !executableExtension) {
       throw std::invalid_argument("Shell registration requires an absolute Windows executable path");
    }
-   // Escape ShellExecute template percent signs, independently of CRT quoting.
-   // No cmd.exe or environment-expanding registry value is involved.
-   std::wstring literal;
-   for (const auto character : executable) {
-      literal += character;
-      if (character == L'%') {
-         literal += L'%';
-      }
-   }
-   return quoteWindowsArgument(literal) + L" mount \"%1\" --explorer";
+   // Keep the executable token literal. Doubling percent signs changes the
+   // executable filename Windows looks up; this is not a CMD/batch command.
+   return quoteWindowsArgument(executable) + L" mount \"%1\" --explorer";
 }
 
 ShellValues shellRegistration(std::wstring_view executable) {
@@ -57,9 +50,24 @@ std::string runShellCommand(ShellRegistry& registry, std::string_view action, st
          auto expected = shellRegistration(path->second);
          owned = *current == expected;
          auto& command = expected.at({L"command", L""});
+         const auto currentCommand = command;
          command.resize(command.size() - std::wstring_view(L" --explorer").size());
-         legacy = *current == expected;
-         owned = owned || legacy;
+         owned = owned || *current == expected;
+         // Recognize only exact registrations emitted by earlier versions,
+         // including the erroneous doubled-percent executable token. All other
+         // values/subkeys still participate in strict ownership comparison.
+         std::wstring oldExecutable;
+         for (const auto character : path->second) {
+            oldExecutable += character;
+            if (character == L'%') {
+               oldExecutable += L'%';
+            }
+         }
+         for (const auto suffix : {L"", L" --explorer"}) {
+            command = quoteWindowsArgument(oldExecutable) + L" mount \"%1\"" + suffix;
+            owned = owned || *current == expected;
+         }
+         legacy = owned && current->at({L"command", L""}) != currentCommand;
       } catch (const std::invalid_argument&) {
          owned = false;
       }
@@ -77,7 +85,7 @@ std::string runShellCommand(ShellRegistry& registry, std::string_view action, st
    if (action == "install" && legacy) {
       registry.remove(*current);
       registry.create(shellRegistration(executable));
-      return "Updated FlacCD Explorer command with visible mount errors.\n";
+      return "Updated FlacCD Explorer command quoting and visible mount errors.\n";
    }
    return "FlacCD Explorer command is installed (shell status does not check ImgDrive).\n";
 }
