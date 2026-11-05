@@ -119,7 +119,12 @@ Default root: `build-release-windows/`:
 - `WindowsBuild/deploy/Release/FlacCD/` and its audited ZIP.
 - `WindowsBuild/deploy/Release/WindowsValidation/` for Windows CTest.
 
-The version comes from CMake's project version. Receipts hash ISCC, the Inno
+An exact `vMAJOR.MINOR.PATCH` Git tag on HEAD supplies the version (for example,
+`v0.1.1` produces `FlacCD-0.1.1-windows-x64-setup.exe`). Untagged builds, source
+archives or builds without Git use the `0.1.1` fallback in
+`cmake/ProjectVersion.cmake`. The build script reconfigures each run, so retagging
+takes effect on the next build. Multiple release tags on HEAD are rejected.
+Receipts hash ISCC, the Inno
 script and the payload audit. Inno's default x86 bootstrap installs the x64
 application payload on x64 Windows; it is a separate executable, not a library
 mixed into the application. Application audits still reject delayed imports;

@@ -39,9 +39,11 @@ if automatic discovery does not find your installation. The target requires a
 native Windows x64 build environment; see the
 [README](../README.md#building-on-windows-with-msys2-ucrt64) for the MSYS2 UCRT64
 packages and end-user installation prerequisites. It creates
-`build-windows/installer/Release/FlacCD-0.1.0-windows-x64-setup.exe` for the current
-version. Change `project(FlacCD VERSION ...)` in `CMakeLists.txt` for future
-MAJOR.MINOR.PATCH releases; keep the installer's AppId stable across upgrades.
+`build-windows/installer/Release/FlacCD-<version>-windows-x64-setup.exe`.
+An exact `vMAJOR.MINOR.PATCH` Git tag on HEAD sets the release version. Rerun
+CMake configuration after retagging (the Linux build script does this each run).
+Untagged/source-archive builds use the fallback in `cmake/ProjectVersion.cmake`.
+Keep the installer's AppId stable across upgrades.
 Installer metadata, filename and version comparison use that CMake version.
 `cmake/ProductMetadata.cmake` supplies publisher **Evenstar Systems** and product
 **FlacCD** to installer/ARP metadata and all five executable VERSIONINFO resources.
