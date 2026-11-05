@@ -1,7 +1,4 @@
 cmake_minimum_required(VERSION 3.20)
-if(NOT CMAKE_HOST_WIN32)
-   message(FATAL_ERROR "Build the installer on Windows with Inno Setup 6.3+")
-endif()
 if(NOT EXISTS "${iscc}")
    message(FATAL_ERROR "Install Inno Setup 6.3+ and configure -DFLACCD_ISCC=C:/path/to/ISCC.exe")
 endif()
@@ -23,16 +20,34 @@ file(MAKE_DIRECTORY "${stagingOutput}")
 set(installerName "FlacCD-${appVersion}-windows-x64-setup.exe")
 set(manifestFile "${stagingOutput}/FlacCDFiles.txt")
 writeInstalledBinaries("${deployDirectory}" "${manifestFile}")
-execute_process(COMMAND "${iscc}" "/DAPP_VERSION=${appVersion}"
-                        "/DAPP_PUBLISHER=${FLACCD_PUBLISHER}" "/DPRODUCT_NAME=${FLACCD_PRODUCT_NAME}"
-                        "/DMANIFEST_FILE=${manifestFile}"
-                        "/DPAYLOAD_DIR=${deployDirectory}" "/DOUTPUT_DIR=${stagingOutput}"
-                        "${sourceRoot}/installer/FlacCD.iss"
-                RESULT_VARIABLE result)
-if(NOT result EQUAL 0 OR NOT EXISTS "${stagingOutput}/${installerName}")
+include("${CMAKE_CURRENT_LIST_DIR}/InnoCompiler.cmake")
+compileInnoInstaller("${manifestFile}" "${deployDirectory}" "${stagingOutput}"
+                     "${sourceRoot}/installer/FlacCD.iss" result compilerLog)
+set(logFile "${installerOutput}/${installerName}.iscc.log")
+file(WRITE "${logFile}" "${compilerLog}")
+if(NOT result STREQUAL "0" OR NOT EXISTS "${stagingOutput}/${installerName}")
    file(REMOVE_RECURSE "${stagingOutput}")
-   message(FATAL_ERROR "Inno Setup compilation failed (${result}); no installer is ready for release")
+   message(FATAL_ERROR "Inno Setup compilation failed (${result}); see ${logFile}. No new installer published")
 endif()
+# Check the compiler output before publishing; this is not a runtime test.
+execute_process(COMMAND "${CMAKE_COMMAND}" "-Dinstaller=${stagingOutput}/${installerName}"
+                        "-DpeObjdump=${peObjdump}" "-DformatFile=${stagingOutput}/InstallerFormat.txt"
+                        -P "${CMAKE_CURRENT_LIST_DIR}/CheckInstaller.cmake"
+                RESULT_VARIABLE verified OUTPUT_VARIABLE inspection ERROR_VARIABLE inspectionError)
+if(NOT verified STREQUAL "0")
+   file(APPEND "${logFile}" "\n${inspection}\n${inspectionError}")
+   file(REMOVE_RECURSE "${stagingOutput}")
+   message(FATAL_ERROR "Installer verification failed; no new installer published: ${inspectionError}")
+endif()
+file(READ "${stagingOutput}/InstallerFormat.txt" installerFormat)
+file(READ "${stagingOutput}/InstallerFormat.txt.imports" installerImports)
 file(RENAME "${stagingOutput}/${installerName}" "${installerOutput}/${installerName}")
+file(SHA256 "${installerOutput}/${installerName}" installerHash)
+file(SHA256 "${iscc}" compilerHash)
+file(SHA256 "${sourceRoot}/installer/FlacCD.iss" scriptHash)
+file(SHA256 "${deployDirectory}/RuntimeDependencies.txt" payloadHash)
+file(WRITE "${installerOutput}/${installerName}.sha256" "${installerHash}  ${installerName}\n")
+file(WRITE "${installerOutput}/${installerName}.build.txt"
+   "Host: ${CMAKE_HOST_SYSTEM_NAME}\nInno compiler SHA256: ${compilerHash}\nInno script SHA256: ${scriptHash}\nPayload audit SHA256: ${payloadHash}\nInstaller format: ${installerFormat}\nInstaller imports (including delayed system DLLs):\n${installerImports}\nCompiler log: ${logFile}\nWindows runtime/integration validation is separate.\n")
 file(REMOVE_RECURSE "${stagingOutput}")
 message(STATUS "Installer: ${installerOutput}/${installerName}")

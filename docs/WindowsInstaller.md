@@ -7,6 +7,10 @@ The Start Menu entry opens this usage document in Notepad. There is no GUI yet.
 
 ## Building a release
 
+For a complete Linux-hosted release, including Inno Setup under Wine, use
+[LinuxWindowsRelease.md](LinuxWindowsRelease.md). Windows-native packaging and
+its existing smoke tests remain supported below.
+
 For Linux-built Windows binaries, follow
 [WindowsCrossCompilation.md](WindowsCrossCompilation.md). Its Windows packaging
 script uses the transferred audited deployment and this same Inno Setup script,

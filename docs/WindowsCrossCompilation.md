@@ -1,7 +1,13 @@
 # Windows x64 cross-compilation from CentOS Stream 9
 
-Compile the application and its tests on Linux; run Windows tests and Inno Setup
-on Windows. No Windows compiler, Visual Studio, WDK, Wine, or MSYS2 installation
+The entire installer can now also be built on Linux: see
+[LinuxWindowsRelease.md](LinuxWindowsRelease.md). The Windows-side packaging
+instructions below remain available as an alternative; Windows runtime testing
+is still a separate release gate.
+
+Compile the application and its tests on Linux; run Windows runtime tests in
+the VM. Inno Setup compilation can run on Linux using the release guide above,
+or on Windows using the alternative commands below. No Windows compiler, Visual Studio, WDK, Wine, or MSYS2 installation
 is needed for compilation. ImgDrive is installed separately on the Windows VM;
 its application and driver are never included in our payload.
 

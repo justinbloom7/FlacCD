@@ -111,6 +111,13 @@ if(BUILD_TESTING)
       "-DtestDirectory=${CMAKE_CURRENT_BINARY_DIR}/toolchain-fixtures"
       -P "${PROJECT_SOURCE_DIR}/tests/CrossToolchainTests.cmake")
    set_tests_properties(cross-toolchain PROPERTIES LABELS host)
+   if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" AND NOT CMAKE_CROSSCOMPILING)
+      find_package(Python3 REQUIRED COMPONENTS Interpreter)
+      add_test(NAME pe-delay-imports COMMAND "${Python3_EXECUTABLE}"
+         "${PROJECT_SOURCE_DIR}/tests/PeDelayImportsTests.py"
+         "${PROJECT_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/delay-import-fixtures" "${CMAKE_COMMAND}")
+      set_tests_properties(pe-delay-imports PROPERTIES LABELS host)
+   endif()
    add_executable(flaccd-shell-tests tests/ShellRegistrationTests.cpp)
    target_link_libraries(flaccd-shell-tests PRIVATE flaccd-mount)
    set_target_properties(flaccd-shell-tests PROPERTIES CXX_EXTENSIONS OFF)
@@ -145,6 +152,16 @@ if(BUILD_TESTING)
             "-DfixtureGenerator=${CMAKE_GENERATOR}"
             "-DcompilerIsGnu=$<STREQUAL:${CMAKE_CXX_COMPILER_ID},GNU>"
             -P "${CMAKE_CURRENT_SOURCE_DIR}/tests/WindowsDeploymentTests.cmake")
+         if(CMAKE_HOST_SYSTEM_NAME STREQUAL "Linux" AND NOT CMAKE_CROSSCOMPILING)
+            add_test(NAME wine-installer-packaging COMMAND "${CMAKE_COMMAND}"
+               "-DsourceRoot=${PROJECT_SOURCE_DIR}"
+               "-DtestDirectory=${CMAKE_CURRENT_BINARY_DIR}/wine-installer-fixtures"
+               "-Dassembler=${flaccdFixtureAssembler}" "-Dlinker=${CMAKE_LINKER}"
+               "-Dobjcopy=${CMAKE_OBJCOPY}"
+               "-DpeObjdump=${CMAKE_OBJDUMP}"
+               -P "${PROJECT_SOURCE_DIR}/tests/WineInstallerTests.cmake")
+            set_tests_properties(wine-installer-packaging PROPERTIES LABELS host)
+         endif()
       endif()
    endif()
    add_executable(flaccd-process-diagnostic-tests tests/ProcessArgumentDiagnosticsTests.cpp)

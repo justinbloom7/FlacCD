@@ -11,6 +11,9 @@ To build the complete Windows application on CentOS Stream 9, see
 [WindowsCrossCompilation.md](docs/WindowsCrossCompilation.md). The guide uses a
 pinned LLVM-MinGW UCRT toolchain and static libFLAC, with Linux-side deployment
 audits and Windows-side test/installer steps.
+To also produce the existing Inno Setup installer on Linux, use the Wine-based
+[Linux release guide](docs/LinuxWindowsRelease.md) and its one-command release
+driver. Windows VM integration validation remains required.
 
 ## Installing on Windows
 
