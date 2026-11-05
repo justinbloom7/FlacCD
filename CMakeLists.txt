@@ -117,6 +117,10 @@ if(BUILD_TESTING)
          "${PROJECT_SOURCE_DIR}/tests/PeDelayImportsTests.py"
          "${PROJECT_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/delay-import-fixtures" "${CMAKE_COMMAND}")
       set_tests_properties(pe-delay-imports PROPERTIES LABELS host)
+      add_test(NAME windows-build-scripts COMMAND "${Python3_EXECUTABLE}"
+         "${PROJECT_SOURCE_DIR}/tests/WindowsBuildScriptsTests.py"
+         "${PROJECT_SOURCE_DIR}" "${CMAKE_CURRENT_BINARY_DIR}/build-script-fixtures" "${CMAKE_COMMAND}")
+      set_tests_properties(windows-build-scripts PROPERTIES LABELS host)
    endif()
    add_executable(flaccd-shell-tests tests/ShellRegistrationTests.cpp)
    target_link_libraries(flaccd-shell-tests PRIVATE flaccd-mount)
