@@ -11,6 +11,12 @@
 #include <string_view>
 #include <system_error>
 
+#ifdef _WIN32
+#define WIN32_LEAN_AND_MEAN
+#define NOMINMAX
+#include <windows.h>
+#endif
+
 namespace {
 
 void require(bool condition, std::string_view message) {
@@ -30,6 +36,11 @@ void expectError(Operation operation) {
 }
 
 bool isSymlinkUnavailable(const std::error_code& error) {
+#ifdef _WIN32
+   if (error.category() == std::system_category() && error.value() == ERROR_PRIVILEGE_NOT_HELD) {
+      return true;
+   }
+#endif
    // Compare conditions, not message text or platform-specific errno numbers.
    // This also recognizes mapped Windows errors such as missing privileges.
    return error == std::errc::function_not_supported || error == std::errc::not_supported ||
@@ -37,7 +48,42 @@ bool isSymlinkUnavailable(const std::error_code& error) {
           error == std::errc::operation_not_permitted;
 }
 
+std::error_code createFixtureSymlink(const std::filesystem::path& target,
+                                    const std::filesystem::path& link) {
+#ifdef _WIN32
+   // libc++ maps Win32 errors through errno, losing the original error code.
+   // Keep it here so unsupported/permission failures remain distinguishable
+   // from invalid paths. Both CreateSymbolicLinkW paths use native separators.
+   auto nativeTarget = target;
+   auto nativeLink = link;
+   nativeTarget.make_preferred();
+   nativeLink.make_preferred();
+   if (CreateSymbolicLinkW(nativeLink.c_str(), nativeTarget.c_str(), SYMBOLIC_LINK_FLAG_ALLOW_UNPRIVILEGED_CREATE)) {
+      return {};
+   }
+   auto error = GetLastError();
+   if (error == ERROR_INVALID_PARAMETER) {
+      // Older Windows/filesystems may reject the unprivileged-create flag.
+      if (CreateSymbolicLinkW(nativeLink.c_str(), nativeTarget.c_str(), 0)) {
+         return {};
+      }
+      error = GetLastError();
+   }
+   return {static_cast<int>(error), std::system_category()};
+#else
+   std::error_code error;
+   std::filesystem::create_symlink(target, link, error);
+   return error;
+#endif
+}
+
 void testSymlinkErrorClassification() {
+#ifdef _WIN32
+   require(isSymlinkUnavailable({ERROR_PRIVILEGE_NOT_HELD, std::system_category()}),
+           "Native symlink privilege failure not recognized");
+   require(!isSymlinkUnavailable({ERROR_INVALID_PARAMETER, std::system_category()}),
+           "Invalid native symlink arguments would be skipped");
+#endif
    for (const auto condition : {std::errc::function_not_supported, std::errc::not_supported,
                                 std::errc::operation_not_supported, std::errc::permission_denied,
                                 std::errc::operation_not_permitted}) {
@@ -173,8 +219,7 @@ void testErrors(const std::filesystem::path& input,
       require(!std::filesystem::exists(existing == cuePath ? binPath : cuePath), "Failed pair left a new output");
       std::filesystem::remove(existing);
    }
-   std::error_code symlinkError;
-   std::filesystem::create_symlink(input, binPath, symlinkError);
+   const auto symlinkError = createFixtureSymlink(input, binPath);
    if (symlinkError) {
       if (!isSymlinkUnavailable(symlinkError)) {
          throw std::filesystem::filesystem_error("Cannot create symlink fixture", input, binPath, symlinkError);

@@ -7,6 +7,19 @@ it does not decode audio or mount a drive. `flaccd-export` uses the core CDDA
 reader for full-disc, track, range, split-track, and BIN/CUE exports. No custom
 Windows driver is built or installed.
 
+To build the Windows applications and installer **on CentOS Stream 9**, run:
+
+```bash
+scripts/SetupWindowsBuild.sh --install-system-packages
+scripts/BuildWindows.sh
+```
+
+Setup's explicit package option uses sudo once; omit it if host packages are
+already installed. Normal builds run as your user. The
+[Linux release guide](docs/LinuxWindowsRelease.md) explains what the scripts do,
+their options and outputs. [WindowsCrossCompilation.md](docs/WindowsCrossCompilation.md)
+covers the architecture and Windows VM validation, which remains required.
+
 ## Installing on Windows
 
 End users need Windows 10/11 **x64** and a separately installed, working

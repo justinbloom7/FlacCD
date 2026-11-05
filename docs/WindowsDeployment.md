@@ -174,22 +174,18 @@ proprietary application/driver is not included.
 
 ## Linux-to-Windows cross-compilation
 
-Use your existing MinGW CMake toolchain and target libFLAC/pkg-config setup:
+Use [WindowsCrossCompilation.md](WindowsCrossCompilation.md) for the tested
+CentOS Stream 9 workflow: pinned LLVM-MinGW UCRT, separately cross-built static
+libFLAC, `flaccd-package`, and `flaccd-validation`. Cross configuration requires
+an isolated `FLACCD_WINDOWS_DEPENDENCY_PREFIX` and checks x64/UCRT and package
+directory isolation. LLVM-MinGW uses static libc++/compiler-rt instead of GCC's
+runtime options. The existing PE audit still uses host GNU objdump.
 
-```sh
-cmake -S . -B build-cross -G Ninja \
-  -DCMAKE_TOOLCHAIN_FILE=/actual/path/to/mingw-toolchain.cmake \
-  -DCMAKE_BUILD_TYPE=Release \
-  "-DFLACCD_WINDOWS_RUNTIME_DIRS=/actual/windows-target-prefix/bin"
-cmake --build build-cross --target flaccd-package
-```
-
-The toolchain must select Windows/MinGW and target FLAC libraries, not host Linux
-libFLAC. Supply a target-aware pkg-config wrapper using `PKG_CONFIG_EXECUTABLE`
-where needed. `CMAKE_OBJDUMP`/`FLACCD_WINDOWS_OBJDUMP` must read target PE files;
-compiler runtime queries use the selected compiler. No Windows VM/Wine is needed
-to stage and inspect imports. Runtime tests still require Windows. Native Linux
-builds have no Windows runtime flags or deployment targets.
+No Windows VM/Wine is needed to compile, stage or inspect imports. Only
+host-labelled CMake tests run in the Linux cross tree; Windows CTest and
+CMD/PowerShell smoke checks run in the VM. The guide also covers compiling the
+existing Inno installer on Windows directly from the transferred deployment.
+Native Linux builds have no Windows runtime flags or deployment targets.
 
 For MSVC builds, MinGW link flags are not applied. The PE deployment targets still
 require GNU objdump and explicitly configured redistributable DLL directories;
